@@ -22,12 +22,12 @@ def test_connection():
     try:
         response = requests.get(f"http://{PC_IP}:{PC_PORT}/health", timeout=5)
         if response.status_code == 200:
-            print("✓ Connected to PC server!")
+            print("[OK] Connected to PC server!")
             data = response.json()
             print(f"  Server mode: {data.get('mode', 'standard')}")
             return True
     except:
-        print("✗ Cannot connect to PC server!")
+        print("[ERROR] Cannot connect to PC server!")
         print(f"  Make sure server is running on {PC_IP}:{PC_PORT}")
         return False
     return False
@@ -51,7 +51,7 @@ def send_frame(frame):
 
 def main():
     print("\n" + "="*50)
-    print("🎥 Raspberry Pi Live Streaming Client")
+    print("Raspberry Pi Live Streaming Client")
     print("="*50)
     print(f"PC Server: {PC_IP}:{PC_PORT}")
     print(f"Target FPS: {FPS_TARGET}")
@@ -66,7 +66,7 @@ def main():
     cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
-        print("✗ Error: Cannot open webcam")
+        print("[ERROR] Cannot open webcam")
         sys.exit(1)
     
     # Set camera properties for better performance
@@ -74,7 +74,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
     
-    print("✓ Webcam opened")
+    print("[OK] Webcam opened")
     print("\nStarting live stream...")
     print("Press Ctrl+C to stop\n")
     
@@ -92,7 +92,7 @@ def main():
             # Capture frame
             ret, frame = cap.read()
             if not ret:
-                print("✗ Failed to capture frame")
+                print("[ERROR] Failed to capture frame")
                 continue
             
             # Send frame for detection
