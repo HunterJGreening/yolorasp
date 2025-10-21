@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 
 # Configuration - ALREADY SET TO YOUR PC'S IP!
-PC_IP = "192.168.1.107"  # Your PC's IP address
+PC_IP = "172.20.10.2"  # Your PC's IP address
 PC_PORT = 5000
 SERVER_URL = f"http://{PC_IP}:{PC_PORT}/detect"
 

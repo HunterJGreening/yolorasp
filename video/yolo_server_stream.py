@@ -195,7 +195,7 @@ def stream_viewer():
             
             <div class="info">
                 <p class="status">● LIVE - Streaming from Raspberry Pi</p>
-                <p>Server: 192.168.1.107:5000</p>
+                <p>Server: 172.20.10.2:5000</p>
                 <p>Model: YOLOv8n (nano)</p>
                 <div class="detections">
                     <p><strong>Real-time object detection with bounding boxes</strong></p>
@@ -241,7 +241,7 @@ def dashboard():
             <p><strong>Model:</strong> YOLOv8n (nano)</p>
             <p><strong>Mode:</strong> Live Streaming</p>
             <p><strong>Status:</strong> Ready to receive video</p>
-            <p><strong>Address:</strong> 192.168.1.107:5000</p>
+            <p><strong>Address:</strong> 172.20.10.2:5000</p>
         </div>
         
         <div class="info">
@@ -264,12 +264,12 @@ def dashboard():
 
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("🎥 YOLO Live Streaming Server")
+    print("YOLO Live Streaming Server")
     print("="*50)
     print("Status: Ready")
     print("Address: http://0.0.0.0:5000")
-    print("Stream Viewer: http://192.168.1.107:5000/stream")
-    print("PC IP: 192.168.1.107")
+    print("Stream Viewer: http://172.20.10.2:5000/stream")
+    print("PC IP: 172.20.10.2")
     print("="*50 + "\n")
     
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
