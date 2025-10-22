@@ -14,6 +14,8 @@ from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template_string
 import warnings
 import webbrowser
+import subprocess
+import os
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -37,7 +39,7 @@ fps = 0
 last_time = time.time()
 detection_running = False
 
-# COCO class names (80 classes)
+# COCO class names - focusing on people detection
 CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
     'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
@@ -51,6 +53,14 @@ CLASSES = [
     'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
+# Person detection only - class ID 0 is 'person' in COCO
+PERSON_CLASS_ID = 0
+
+# Voice announcement settings
+VOICE_ENABLED = True
+last_announcement_time = {}
+ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
+
 def load_yolo_model():
     """Load YOLO model using OpenCV DNN"""
     print("Loading YOLO model...")
@@ -63,6 +73,78 @@ def load_yolo_model():
     except:
         print("YOLOv8 model not found. Using simple detection...")
         return None
+
+def classify_gender(frame, bbox):
+    """Simple gender classification based on clothing colors and patterns"""
+    x, y, w, h = bbox
+    
+    # Extract person region
+    person_region = frame[y:y+h, x:x+w]
+    
+    if person_region.size == 0:
+        return "Unknown"
+    
+    # Convert to HSV for better color analysis
+    hsv = cv2.cvtColor(person_region, cv2.COLOR_BGR2HSV)
+    
+    # Analyze colors in the upper body region (top 40% of bounding box)
+    upper_region = person_region[:int(h*0.4), :]
+    if upper_region.size > 0:
+        # Calculate average color
+        avg_color = np.mean(upper_region, axis=(0, 1))
+        
+        # Simple heuristic: darker colors might indicate male clothing
+        # This is a very basic approach - in reality you'd need ML models
+        brightness = np.mean(avg_color)
+        
+        if brightness < 100:  # Darker colors
+            return "Male"
+        elif brightness > 150:  # Lighter colors
+            return "Female"
+        else:
+            return "Unknown"
+    
+    return "Unknown"
+
+def announce_person(gender, bbox):
+    """Announce when a person is detected"""
+    global last_announcement_time, ANNOUNCEMENT_COOLDOWN
+    
+    if not VOICE_ENABLED:
+        return
+    
+    # Create a unique ID for this person based on position
+    x, y, w, h = bbox
+    person_id = f"{x//50}_{y//50}"  # Grid-based ID to avoid duplicate announcements
+    
+    current_time = time.time()
+    
+    # Check if we've announced this person recently
+    if person_id in last_announcement_time:
+        if current_time - last_announcement_time[person_id] < ANNOUNCEMENT_COOLDOWN:
+            return
+    
+    # Update last announcement time
+    last_announcement_time[person_id] = current_time
+    
+    # Create announcement text
+    if gender == "Male":
+        message = "Male person detected"
+    elif gender == "Female":
+        message = "Female person detected"
+    else:
+        message = "Person detected"
+    
+    print(f"🔊 ANNOUNCING: {message}")
+    
+    # Use espeak for text-to-speech (install with: sudo apt install espeak)
+    try:
+        subprocess.Popen(['espeak', '-s', '150', '-v', 'en', message], 
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("⚠️ espeak not installed. Install with: sudo apt install espeak")
+    except Exception as e:
+        print(f"⚠️ Voice announcement failed: {e}")
 
 def detect_objects_opencv(frame, net):
     """Detect objects using OpenCV DNN"""
@@ -89,7 +171,8 @@ def detect_objects_opencv(frame, net):
             class_id = np.argmax(scores)
             confidence = scores[class_id]
             
-            if confidence > 0.5:  # Confidence threshold
+            # Only detect people (class_id = 0)
+            if confidence > 0.5 and class_id == PERSON_CLASS_ID:
                 center_x = int(detection[0] * width)
                 center_y = int(detection[1] * height)
                 w = int(detection[2] * width)
@@ -114,12 +197,19 @@ def detect_objects_opencv(frame, net):
             # Draw bounding box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
-            # Draw label
-            label = f"{CLASSES[class_id]}: {confidence:.2f}"
+            # Classify gender
+            gender = classify_gender(frame, [x, y, w, h])
+            
+            # Announce person detection
+            announce_person(gender, [x, y, w, h])
+            
+            # Draw label with gender
+            label = f"{CLASSES[class_id]} ({gender}): {confidence:.2f}"
             cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
             detections.append({
                 'class': CLASSES[class_id],
+                'gender': gender,
                 'confidence': round(confidence, 2),
                 'bbox': [x, y, x + w, y + h]
             })
@@ -306,15 +396,16 @@ def dashboard():
     </head>
     <body>
         <div class="container">
-            <h1>🍓 Simple Pi Detection Server</h1>
+            <h1>👥 People Detection Server</h1>
             
             <div class="status">
-                ✓ Server Running - Basic Detection Active
+                ✓ Server Running - People Detection Active
             </div>
             
             <div class="info-card">
                 <h3>📊 Server Information</h3>
-                <p><strong>Detection:</strong> OpenCV DNN (No ultralytics needed)</p>
+                <p><strong>Detection:</strong> People Only (Men/Women)</p>
+                <p><strong>Gender Classification:</strong> Basic Color Analysis</p>
                 <p><strong>Camera:</strong> Built-in Webcam</p>
                 <p><strong>Resolution:</strong> 640x480</p>
                 <p><strong>Target FPS:</strong> 10</p>
@@ -324,7 +415,20 @@ def dashboard():
                 <a href="/stream" class="button">📺 View Live Stream</a>
                 <a href="/api/detections" class="button">🔍 API Endpoint</a>
                 <a href="/health" class="button">❤️ Health Check</a>
+                <button onclick="toggleVoice()" class="button" id="voiceButton">🔊 Voice: ON</button>
             </div>
+            
+            <script>
+            function toggleVoice() {
+                fetch('/toggle_voice', {method: 'POST'})
+                .then(response => response.json())
+                .then(data => {
+                    const button = document.getElementById('voiceButton');
+                    button.textContent = data.voice_enabled ? '🔊 Voice: ON' : '🔇 Voice: OFF';
+                    alert(data.message);
+                });
+            }
+            </script>
             
             <div class="info-card">
                 <h3>📖 How to Use</h3>
@@ -471,7 +575,7 @@ def get_detections():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    global camera, fps
+    global camera, fps, VOICE_ENABLED
     
     camera_status = "connected" if camera and camera.isOpened() else "disconnected"
     
@@ -481,7 +585,22 @@ def health():
         'mode': 'live_detection',
         'camera': camera_status,
         'fps': fps,
+        'voice_enabled': VOICE_ENABLED,
         'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/toggle_voice', methods=['POST'])
+def toggle_voice():
+    """Toggle voice announcements on/off"""
+    global VOICE_ENABLED
+    
+    VOICE_ENABLED = not VOICE_ENABLED
+    status = "enabled" if VOICE_ENABLED else "disabled"
+    
+    return jsonify({
+        'success': True,
+        'voice_enabled': VOICE_ENABLED,
+        'message': f"Voice announcements {status}"
     })
 
 def cleanup():
