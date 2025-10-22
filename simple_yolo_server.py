@@ -13,6 +13,7 @@ import threading
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template_string
 import warnings
+import webbrowser
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -54,18 +55,13 @@ def load_yolo_model():
     """Load YOLO model using OpenCV DNN"""
     print("Loading YOLO model...")
     
-    # You'll need to download these files:
-    # wget https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4.weights
-    # wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4.cfg
-    # wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/data/coco.names
-    
     try:
-        # Try to load YOLOv4 model
-        net = cv2.dnn.readNet("yolov4.weights", "yolov4.cfg")
-        print("YOLOv4 model loaded successfully!")
+        # Try to load YOLOv8 ONNX model
+        net = cv2.dnn.readNet("yolov8n.onnx")
+        print("YOLOv8 ONNX model loaded successfully!")
         return net
     except:
-        print("YOLOv4 model not found. Using simple detection...")
+        print("YOLOv8 model not found. Using simple detection...")
         return None
 
 def detect_objects_opencv(frame, net):
@@ -426,7 +422,7 @@ def stream_viewer():
             <h1>🎥 Live Detection Stream</h1>
             
             <div class="stream-container">
-                <img id="stream" src="{{ url_for('video_feed') }}" />
+                <img id="stream" src="/video_feed" />
             </div>
             
             <div class="controls">
@@ -519,6 +515,9 @@ if __name__ == '__main__':
     print(f"Live stream: http://[PI_IP]:{PI_PORT}/stream")
     print(f"API endpoint: http://[PI_IP]:{PI_PORT}/api/detections")
     print("="*60 + "\n")
+    
+    # Auto-open browser after 1.5 seconds
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PI_PORT}/stream")).start()
     
     try:
         app.run(host=PI_IP, port=PI_PORT, debug=False, threaded=True)
