@@ -16,25 +16,25 @@ import warnings
 import webbrowser
 import subprocess
 import os
-import torch
+# import torch  # Removed for Pi 3A 32-bit compatibility
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
 app = Flask(__name__)
 
-# Configuration
+# Configuration optimized for Pi 3A 32-bit
 CAMERA_INDEX = 0
 
-# Override some config per requested snippet
+# Optimized settings for Pi 3A performance
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
-TARGET_FPS = 5  # Lower FPS for Pi / snippet value
+TARGET_FPS = 3  # Reduced FPS for Pi 3A stability
 PI_IP = "0.0.0.0"
 PI_PORT = 5000
 
-# New detection thresholds
-CONFIDENCE_THRESHOLD = 0.5
+# Detection thresholds optimized for Pi 3A
+CONFIDENCE_THRESHOLD = 0.6  # Higher threshold to reduce false positives
 NMS_THRESHOLD = 0.4
 
 # Global variables
@@ -75,32 +75,25 @@ ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
 # ===============================
 
 def load_yolo_model():
-    """Load YOLOv3-tiny via OpenCV DNN if available"""
+    """Load YOLOv3-tiny via OpenCV DNN if available (optimized for Pi 3A)"""
     cfg = "yolov3-tiny.cfg"
     weights = "yolov3-tiny.weights"
     try:
-        print("Loading YOLOv3-tiny model...")
+        print("Loading YOLOv3-tiny model for Pi 3A...")
         net = cv2.dnn.readNetFromDarknet(cfg, weights)
         net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         print("✅ YOLOv3-tiny model loaded successfully!")
         return net
     except Exception as e:
-        print(f"[WARN] YOLOv3-tiny not loaded ({e}). Falling back to simple detection.")
+        print(f"[INFO] YOLOv3-tiny not available ({e}). Using simple detection mode.")
+        print("[INFO] To use YOLOv3-tiny, download yolov3-tiny.cfg and yolov3-tiny.weights")
         return None
 
 def load_gender_model():
-    """Load gender classification PyTorch model if available"""
-    path = "gender_model.pt"
-    try:
-        print("Loading gender classification model...")
-        model = torch.load(path, map_location=torch.device("cpu"))
-        model.eval()
-        print("✅ Gender model loaded successfully!")
-        return model
-    except Exception as e:
-        print(f"[WARN] Gender model not loaded ({e}). Gender classification disabled.")
-        return None
+    """Gender classification disabled for Pi 3A 32-bit compatibility"""
+    print("[INFO] Gender classification using heuristic method only (PyTorch not available on Pi 3A 32-bit)")
+    return None
 
 # load models at startup (will be used in detection worker)
 yolo_net = load_yolo_model()
@@ -174,24 +167,12 @@ def detect_objects_opencv(frame, net):
 # GENDER CLASSIFICATION (PyTorch)
 # ===============================
 def predict_gender(face_crop):
-    """Predict gender using loaded PyTorch model (if available)."""
-    if gender_model is None:
-        return "Unknown"
-    try:
-        face = cv2.resize(face_crop, (64, 64))
-        face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-        face = torch.tensor(face.transpose(2, 0, 1), dtype=torch.float32).unsqueeze(0) / 255.0
-        with torch.no_grad():
-            output = gender_model(face)
-            pred = torch.argmax(output, dim=1).item()
-        return "Male" if pred == 1 else "Female"
-    except Exception as e:
-        # if prediction fails, return Unknown
-        return "Unknown"
+    """Predict gender using heuristic method only (PyTorch not available on Pi 3A 32-bit)."""
+    # Always return Unknown since PyTorch model is not available
+    return "Unknown"
 
 def classify_gender(frame, bbox):
-    """Simple gender classification based on clothing colors and patterns"""
-    # Keep original heuristic as fallback if PyTorch model not available
+    """Gender classification using heuristic method (optimized for Pi 3A)"""
     x, y, w, h = bbox
     
     # Extract person region
@@ -200,27 +181,34 @@ def classify_gender(frame, bbox):
     if person_region.size == 0:
         return "Unknown"
     
-    # If PyTorch model present, try that first (using bounding box crop)
-    if gender_model is not None:
-        try:
-            g = predict_gender(person_region)
-            if g != "Unknown":
-                return g
-        except:
-            pass
-    
-    # Fallback heuristic:
-    hsv = cv2.cvtColor(person_region, cv2.COLOR_BGR2HSV)
-    upper_region = person_region[:int(h*0.4), :]
-    if upper_region.size > 0:
-        avg_color = np.mean(upper_region, axis=(0, 1))
-        brightness = np.mean(avg_color)
-        if brightness < 100:
-            return "Male"
-        elif brightness > 150:
-            return "Female"
-        else:
-            return "Unknown"
+    # Improved heuristic method for Pi 3A
+    try:
+        # Focus on upper body region for clothing analysis
+        upper_region = person_region[:int(h*0.4), :]
+        if upper_region.size > 0:
+            # Convert to HSV for better color analysis
+            hsv = cv2.cvtColor(upper_region, cv2.COLOR_BGR2HSV)
+            
+            # Analyze color characteristics
+            avg_color = np.mean(upper_region, axis=(0, 1))
+            brightness = np.mean(avg_color)
+            
+            # Analyze hue distribution
+            hue_values = hsv[:, :, 0].flatten()
+            hue_mean = np.mean(hue_values)
+            hue_std = np.std(hue_values)
+            
+            # Simple classification based on brightness and color patterns
+            if brightness < 80:
+                return "Male"  # Darker clothing
+            elif brightness > 180:
+                return "Female"  # Brighter clothing
+            elif hue_std > 30:  # More varied colors
+                return "Female"
+            else:
+                return "Male"
+    except Exception as e:
+        print(f"[WARN] Gender classification failed: {e}")
     
     return "Unknown"
 
@@ -265,31 +253,41 @@ def announce_person(gender, bbox):
         print(f"⚠️ Voice announcement failed: {e}")
 
 def detect_objects_simple(frame):
-    """Simple object detection using OpenCV (no YOLO model needed)"""
+    """Simple object detection using OpenCV (optimized for Pi 3A)"""
     detections = []
     
-    # Convert to grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Simple edge detection
-    edges = cv2.Canny(gray, 50, 150)
-    
-    # Find contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Draw rectangles around detected objects
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > 1000:  # Minimum area threshold
-            x, y, w, h = cv2.boundingRect(contour)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, "Object", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            detections.append({
-                'class': 'object',
-                'confidence': 0.8,
-                'bbox': [x, y, x + w, y + h]
-            })
+    try:
+        # Convert to grayscale for better performance
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Adaptive threshold for better edge detection
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter and draw rectangles around detected objects
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 2000:  # Higher threshold for Pi 3A to reduce false positives
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Filter by aspect ratio to detect person-like objects
+                aspect_ratio = h / w if w > 0 else 0
+                if 1.2 < aspect_ratio < 3.0:  # Person-like aspect ratio
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
+                    detections.append({
+                        'class': 'person',
+                        'confidence': 0.7,
+                        'bbox': [x, y, x + w, y + h]
+                    })
+    except Exception as e:
+        print(f"[WARN] Simple detection failed: {e}")
     
     return detections, frame
 
@@ -344,7 +342,7 @@ def detection_worker():
         try:
             detections, annotated = detect_objects_opencv(frame.copy(), net)
             
-            # Run gender detection for people if possible
+            # Run gender detection for people (heuristic method only)
             for det in detections:
                 if det.get("class") == "person":
                     x1, y1, x2, y2 = det.get("bbox", [0,0,0,0])
@@ -353,12 +351,15 @@ def detection_worker():
                     x1 = max(0, x1); y1 = max(0, y1)
                     x2 = min(annotated.shape[1]-1, x2); y2 = min(annotated.shape[0]-1, y2)
                     if x2 > x1 and y2 > y1:
-                        crop = annotated[y1:y2, x1:x2]
-                        gender = classify_gender(crop, [0, 0, x2-x1, y2-y1])
+                        # Use heuristic gender classification (PyTorch not available on Pi 3A)
+                        gender = classify_gender(annotated, [x1, y1, x2-x1, y2-y1])
                         # annotate on frame and the detection record
                         cv2.putText(annotated, gender, (x1, y2 + 20),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
                         det['gender'] = gender
+                        
+                        # Announce person detection
+                        announce_person(gender, [x1, y1, x2-x1, y2-y1])
                     else:
                         det['gender'] = "Unknown"
             
@@ -471,10 +472,10 @@ def dashboard():
             <div class="info-card">
                 <h3>📊 Server Information</h3>
                 <p><strong>Detection:</strong> People Only (Men/Women)</p>
-                <p><strong>Gender Classification:</strong> Basic Color Analysis</p>
+                <p><strong>Gender Classification:</strong> Heuristic Color Analysis (Pi 3A Optimized)</p>
                 <p><strong>Camera:</strong> Built-in Webcam</p>
-                <p><strong>Resolution:</strong> 640x480</p>
-                <p><strong>Target FPS:</strong> 10</p>
+                <p><strong>Resolution:</strong> 320x240</p>
+                <p><strong>Target FPS:</strong> 3</p>
             </div>
             
             <div class="actions">
@@ -597,7 +598,7 @@ def stream_viewer():
             
             <div class="controls">
                 <p><span class="status-indicator"></span>LIVE - Streaming from Raspberry Pi Camera</p>
-                <p>Basic object detection with OpenCV</p>
+                <p>Optimized object detection for Pi 3A 32-bit</p>
                 <a href="/" class="back-button">← Back to Dashboard</a>
             </div>
         </div>
