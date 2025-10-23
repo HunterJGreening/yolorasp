@@ -75,20 +75,33 @@ ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
 # ===============================
 
 def load_yolo_model():
-    """Load YOLOv3-tiny via OpenCV DNN if available (optimized for Pi 3A)"""
-    cfg = "yolov3-tiny.cfg"
-    weights = "yolov3-tiny.weights"
-    try:
-        print("Loading YOLOv3-tiny model for Pi 3A...")
-        net = cv2.dnn.readNetFromDarknet(cfg, weights)
-        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-        print("✅ YOLOv3-tiny model loaded successfully!")
-        return net
-    except Exception as e:
-        print(f"[INFO] YOLOv3-tiny not available ({e}). Using simple detection mode.")
-        print("[INFO] To use YOLOv3-tiny, download yolov3-tiny.cfg and yolov3-tiny.weights")
-        return None
+    """Load YOLOv8n model - lightweight approach for Pi 3A 32-bit"""
+    model_path = "yolov8n.pt"
+    onnx_path = "yolov8n.onnx"
+    
+    # First, try to load pre-converted ONNX model
+    if os.path.exists(onnx_path):
+        try:
+            print("Loading YOLOv8n ONNX model for Pi 3A...")
+            net = cv2.dnn.readNetFromONNX(onnx_path)
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            print("✅ YOLOv8n ONNX model loaded successfully!")
+            return net
+        except Exception as e:
+            print(f"[WARN] Failed to load ONNX model: {e}")
+    
+    # Check if .pt file exists but no ONNX
+    if os.path.exists(model_path):
+        print(f"[INFO] Found {model_path} but no ONNX version.")
+        print("[INFO] To use YOLOv8n, convert the model to ONNX format:")
+        print("[INFO] 1. On a more powerful machine with ultralytics installed:")
+        print("[INFO] 2. Run: from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx')")
+        print("[INFO] 3. Copy the generated yolov8n.onnx to your Pi")
+        print("[INFO] 4. Or use simple detection mode (no conversion needed)")
+    
+    print("[INFO] Using simple detection mode (no YOLOv8n)")
+    return None
 
 def load_gender_model():
     """Gender classification disabled for Pi 3A 32-bit compatibility"""
@@ -103,65 +116,97 @@ gender_model = load_gender_model()
 # OBJECT DETECTION (YOLOv3-tiny)
 # ===============================
 def detect_objects_opencv(frame, net):
-    """Detect objects using YOLOv3-tiny (OpenCV DNN). Returns detections and annotated frame."""
+    """Detect objects using YOLOv8n ONNX (OpenCV DNN) or fallback to simple detection."""
     if net is None:
         # fallback to simple contours-based detector
         return detect_objects_simple(frame)
 
+    # Check if it's an OpenCV DNN model (ONNX)
+    if hasattr(net, 'setInput'):
+        return detect_objects_onnx(frame, net)
+    else:
+        # Unknown model type, fallback to simple detection
+        print("[WARN] Unknown model type, falling back to simple detection")
+        return detect_objects_simple(frame)
+
+def detect_objects_onnx(frame, net):
+    """Detect objects using YOLOv8n ONNX model via OpenCV DNN (optimized for Pi 3A)"""
     height, width = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+    
+    # Use smaller input size for Pi 3A performance
+    input_size = 416  # Smaller than standard 640 for better performance
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_size, input_size), swapRB=True, crop=False)
     net.setInput(blob)
-    layer_names = net.getLayerNames()
+    
     try:
-        output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
-    except:
-        # older OpenCV might return as list of lists
-        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-    layer_outputs = net.forward(output_layers)
-
+        outputs = net.forward()
+    except Exception as e:
+        print(f"[WARN] ONNX inference failed: {e}")
+        return detect_objects_simple(frame)
+    
     boxes, confidences, class_ids = [], [], []
-
-    for output in layer_outputs:
-        for detection in output:
-            scores = detection[5:]
-            if len(scores) == 0:
-                continue
+    
+    # YOLOv8n ONNX output format: [1, 84, 8400] where 84 = 4 (bbox) + 80 (classes)
+    if len(outputs) > 0:
+        output = outputs[0]
+        if len(output.shape) == 3:
+            output = output[0]  # Remove batch dimension
+        
+        # Process detections
+        for detection in output.T:
+            scores = detection[4:]
             class_id = int(np.argmax(scores))
             confidence = float(scores[class_id])
+            
             if confidence > CONFIDENCE_THRESHOLD:
-                center_x = int(detection[0] * width)
-                center_y = int(detection[1] * height)
-                w = int(detection[2] * width)
-                h = int(detection[3] * height)
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
-                boxes.append([x, y, w, h])
-                confidences.append(confidence)
-                class_ids.append(class_id)
-
+                # Extract bounding box (normalized coordinates)
+                x_center, y_center, w, h = detection[:4]
+                
+                # Convert to pixel coordinates
+                x = int((x_center - w/2) * width)
+                y = int((y_center - h/2) * height)
+                w = int(w * width)
+                h = int(h * height)
+                
+                # Ensure coordinates are within frame bounds
+                x = max(0, min(x, width))
+                y = max(0, min(y, height))
+                w = min(w, width - x)
+                h = min(h, height - y)
+                
+                if w > 0 and h > 0:  # Valid bounding box
+                    boxes.append([x, y, w, h])
+                    confidences.append(confidence)
+                    class_ids.append(class_id)
+    
+    # Apply NMS
     indices = []
     if len(boxes) > 0:
         indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
-
+    
     detections = []
-
     if len(indices) > 0:
         for i in np.array(indices).flatten():
             x, y, w, h = boxes[i]
             class_id = class_ids[i]
             confidence = confidences[i]
-            label = f"{CLASSES[class_id] if class_id < len(CLASSES) else class_id}: {confidence:.2f}"
-            color = (0, 255, 0)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            detections.append({
-                "class": CLASSES[class_id] if class_id < len(CLASSES) else str(class_id),
-                "confidence": round(confidence, 2),
-                "bbox": [max(0, x), max(0, y), min(width, x + w), min(height, y + h)]
-            })
-
+            
+            # Only detect people for gender classification
+            if class_id == PERSON_CLASS_ID:
+                label = f"{CLASSES[class_id]}: {confidence:.2f}"
+                color = (0, 255, 0)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                detections.append({
+                    "class": CLASSES[class_id],
+                    "confidence": round(confidence, 2),
+                    "bbox": [x, y, x + w, y + h]
+                })
+    
     return detections, frame
+
+# Remove the PyTorch detection function since we're not using PyTorch
 
 # ===============================
 # GENDER CLASSIFICATION (PyTorch)
@@ -480,7 +525,7 @@ def dashboard():
             
             <div class="info-card">
                 <h3>📊 Server Information</h3>
-                <p><strong>Detection:</strong> People Only (Men/Women)</p>
+                <p><strong>Detection:</strong> YOLOv8n (ONNX) or Simple Detection</p>
                 <p><strong>Gender Classification:</strong> Heuristic Color Analysis (Pi 3A Optimized)</p>
                 <p><strong>Camera:</strong> Built-in Webcam</p>
                 <p><strong>Resolution:</strong> 320x240</p>
@@ -607,7 +652,7 @@ def stream_viewer():
             
             <div class="controls">
                 <p><span class="status-indicator"></span>LIVE - Streaming from Raspberry Pi Camera</p>
-                <p>Optimized object detection for Pi 3A 32-bit</p>
+                <p>YOLOv8n object detection optimized for Pi 3A 32-bit</p>
                 <a href="/" class="back-button">← Back to Dashboard</a>
             </div>
         </div>
