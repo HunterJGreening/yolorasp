@@ -28,20 +28,20 @@ CAMERA_INDEX = 0
 
 # Optimized settings for Pi 3A performance
 FRAME_WIDTH = 320
-FRAME_HEIGHT = 240
-TARGET_FPS = 3  # Reduced FPS for Pi 3A stability
+FRAME_HEIGHT = 320
+TARGET_FPS = 4  # Reduced FPS for Pi 3A stability
 PI_IP = "0.0.0.0"
 PI_PORT = 5000
 
 # Performance optimization settings
-FRAME_SKIP_COUNT = 2  # Process every 3rd frame for better performance
+FRAME_SKIP_COUNT = 0  # Process every 3rd frame for better performance
 DETECTION_CACHE_SIZE = 5  # Cache last N detections
-MEMORY_CLEANUP_INTERVAL = 100  # Cleanup every N frames
-PERFORMANCE_MONITORING = True  # Enable performance stats
+MEMORY_CLEANUP_INTERVAL = 50  # Cleanup every N frames
+PERFORMANCE_MONITORING = False  # Enable performance stats
 
 # Detection thresholds optimized for Pi 3A
-CONFIDENCE_THRESHOLD = 0.6  # Higher threshold to reduce false positives
-NMS_THRESHOLD = 0.4
+CONFIDENCE_THRESHOLD = 0.3 # Higher threshold to reduce false positives
+NMS_THRESHOLD = 0.45
 
 # Performance optimization variables
 detection_cache = []
@@ -55,6 +55,19 @@ performance_stats = {
     'memory_usage': 0
 }
 
+# Tracking stability variables
+tracking_history = []
+stable_detection_threshold = 1  # Even more permissive - accept single frame detections
+last_stable_detection = None
+confidence_smoothing = []
+detection_persistence_frames = 8  # Keep detection alive for 8 frames even if lost
+last_detection_time = 0
+
+# Anti-flickering variables
+bbox_history = []  # Store bounding box history for smoothing
+max_bbox_history = 2  # Keep last 5 bounding boxes
+position_smoothing_factor = 0.5  # How much to smooth position changes
+
 # Global variables
 camera = None
 latest_frame = None
@@ -63,6 +76,274 @@ frame_count = 0
 fps = 0
 last_time = time.time()
 detection_running = False
+
+def smooth_detections(current_detections):
+    """Apply temporal smoothing to reduce flickering - ultra-permissive for maximum tracking"""
+    global tracking_history, last_stable_detection, last_detection_time
+    
+    current_time = time.time()
+    
+    if not current_detections:
+        # No current detections, but keep last stable detection alive longer
+        if last_stable_detection and (current_time - last_stable_detection['timestamp']) < 1.5:  # Extended to 1.5 seconds
+            # Return last stable detection if it's recent
+            return [last_stable_detection['detection']]
+        
+        # Decay tracking history very slowly
+        tracking_history = tracking_history[-6:] if len(tracking_history) > 6 else []
+        return []
+    
+    # Add current detections to history
+    tracking_history.append({
+        'detections': current_detections,
+        'timestamp': current_time
+    })
+    
+    # Keep only recent history (last 5 frames for better smoothing)
+    tracking_history = tracking_history[-5:]
+    
+    # Find stable detections across multiple frames
+    stable_detections = []
+    
+    for detection in current_detections:
+        if detection.get('class') == 'person':
+            x1, y1, x2, y2 = detection['bbox']
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            
+            # Count how many recent frames have similar detections
+            similar_count = 0
+            for hist_frame in tracking_history[-3:]:  # Check last 3 frames
+                for hist_det in hist_frame['detections']:
+                    if hist_det.get('class') == 'person':
+                        hx1, hy1, hx2, hy2 = hist_det['bbox']
+                        h_center_x = (hx1 + hx2) / 2
+                        h_center_y = (hy1 + hy2) / 2
+                        
+                        # Check if centers are close (within 60 pixels)
+                        distance = ((center_x - h_center_x) ** 2 + (center_y - h_center_y) ** 2) ** 0.5
+                        if distance < 60:
+                            similar_count += 1
+                            break
+            
+            # Accept detection if found in at least 1 recent frame
+            if similar_count >= 1:
+                # Apply strong smoothing to bbox
+                smoothed_bbox = smooth_bbox_position(detection['bbox'])
+                
+                # Apply position constraints
+                constrained_bbox = apply_position_constraints(smoothed_bbox)
+                
+                detection['bbox'] = constrained_bbox
+                detection['confidence'] = min(0.001, detection['confidence'] + 0.001)  # Moderate confidence boost
+                
+                # Store as last stable detection
+                last_stable_detection = {
+                    'detection': detection,
+                    'timestamp': current_time
+                }
+                last_detection_time = current_time
+                
+                stable_detections.append(detection)
+    
+    # Merge overlapping detections before returning
+    stable_detections = merge_overlapping_detections(stable_detections)
+    
+    return stable_detections
+
+def smooth_bbox(current_bbox, history):
+    """Smooth bounding box coordinates using historical data - minimal smoothing for responsiveness"""
+    if len(history) < 1:
+        return current_bbox
+    
+    # Get recent similar detections
+    recent_bboxes = []
+    x1, y1, x2, y2 = current_bbox
+    center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+    
+    for hist_frame in history[-2:]:  # Check last 2 frames
+        for hist_det in hist_frame['detections']:
+            if hist_det.get('class') == 'person':
+                hx1, hy1, hx2, hy2 = hist_det['bbox']
+                h_center_x, h_center_y = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+                
+                distance = ((center_x - h_center_x) ** 2 + (center_y - h_center_y) ** 2) ** 0.5
+                if distance < 60:  # Reduced tolerance for better stability
+                    recent_bboxes.append([hx1, hy1, hx2, hy2])
+    
+    if len(recent_bboxes) > 0:
+        # Calculate average bbox
+        avg_bbox = [
+            sum(bbox[0] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[1] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[2] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[3] for bbox in recent_bboxes) / len(recent_bboxes)
+        ]
+        
+        # Stronger blending (70% current, 30% average) for better stability
+        smoothed = [
+            int(0.7 * current_bbox[i] + 0.3 * avg_bbox[i]) for i in range(4)
+        ]
+        return smoothed
+    
+    return current_bbox
+
+def smooth_bbox_position(current_bbox):
+    """Apply strong smoothing to bounding box position to eliminate flickering"""
+    global bbox_history
+    
+    # Add current bbox to history
+    bbox_history.append(current_bbox.copy())
+    
+    # Keep only recent history
+    if len(bbox_history) > max_bbox_history:
+        bbox_history = bbox_history[-max_bbox_history:]
+    
+    # If we don't have enough history, return current bbox
+    if len(bbox_history) < 2:
+        return current_bbox
+    
+    # Calculate smoothed bbox using exponential moving average
+    smoothed_bbox = current_bbox.copy()
+    
+    for i in range(4):  # x1, y1, x2, y2
+        # Calculate weighted average with more weight on recent values
+        weights = [0.1, 0.2, 0.3, 0.4, 0.5]  # Increasing weights for more recent values
+        weighted_sum = 0
+        total_weight = 0
+        
+        for j, bbox in enumerate(bbox_history[-5:]):  # Use last 5 bboxes
+            if j < len(weights):
+                weighted_sum += bbox[i] * weights[j]
+                total_weight += weights[j]
+        
+        if total_weight > 0:
+            smoothed_bbox[i] = int(weighted_sum / total_weight)
+    
+    return smoothed_bbox
+
+def apply_position_constraints(bbox):
+    """Apply constraints to prevent extreme position changes"""
+    global bbox_history
+    
+    if len(bbox_history) < 2:
+        return bbox
+    
+    # Get previous bbox
+    prev_bbox = bbox_history[-1]
+    
+    # Calculate maximum allowed change per frame
+    max_change = 20  # pixels per frame
+    
+    constrained_bbox = []
+    for i in range(4):
+        current_val = bbox[i]
+        prev_val = prev_bbox[i]
+        diff = current_val - prev_val
+        
+        # Limit the change
+        if abs(diff) > max_change:
+            if diff > 0:
+                constrained_val = prev_val + max_change
+            else:
+                constrained_val = prev_val - max_change
+        else:
+            constrained_val = current_val
+        
+        constrained_bbox.append(int(constrained_val))
+    
+    return constrained_bbox
+    """Merge overlapping detections to ensure only one detection per person"""
+    if len(detections) <= 1:
+        return detections
+    
+    # Sort detections by confidence (highest first)
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    merged_detections = []
+    used_indices = set()
+    
+    for i, detection in enumerate(detections):
+        if i in used_indices:
+            continue
+            
+        x1, y1, x2, y2 = detection['bbox']
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        # Find overlapping detections
+        overlapping_indices = [i]
+        for j, other_detection in enumerate(detections):
+            if j <= i or j in used_indices:
+                continue
+                
+            ox1, oy1, ox2, oy2 = other_detection['bbox']
+            other_center_x = (ox1 + ox2) / 2
+            other_center_y = (oy1 + oy2) / 2
+            
+            # Check if centers are close (within 100 pixels)
+            distance = ((center_x - other_center_x) ** 2 + (center_y - other_center_y) ** 2) ** 0.5
+            if distance < 100:
+                overlapping_indices.append(j)
+        
+        # Merge overlapping detections
+        if len(overlapping_indices) > 1:
+            # Calculate weighted average bbox based on confidence
+            total_weight = 0
+            weighted_x1 = 0
+            weighted_y1 = 0
+            weighted_x2 = 0
+            weighted_y2 = 0
+            max_confidence = 0
+            
+            for idx in overlapping_indices:
+                det = detections[idx]
+                weight = det['confidence']
+                total_weight += weight
+                
+                dx1, dy1, dx2, dy2 = det['bbox']
+                weighted_x1 += dx1 * weight
+                weighted_y1 += dy1 * weight
+                weighted_x2 += dx2 * weight
+                weighted_y2 += dy2 * weight
+                
+                if det['confidence'] > max_confidence:
+                    max_confidence = det['confidence']
+            
+            # Create merged detection
+            merged_bbox = [
+                int(weighted_x1 / total_weight),
+                int(weighted_y1 / total_weight),
+                int(weighted_x2 / total_weight),
+                int(weighted_y2 / total_weight)
+            ]
+            
+            merged_detection = {
+                'class': 'person',
+                'confidence': min(0.99, max_confidence + 0.1),  # Boost confidence for merged detection
+                'bbox': merged_bbox
+            }
+            
+            merged_detections.append(merged_detection)
+            
+            # Mark all overlapping detections as used
+            for idx in overlapping_indices:
+                used_indices.add(idx)
+        else:
+            # No overlapping detections, keep as is
+            merged_detections.append(detection)
+            used_indices.add(i)
+    
+    return merged_detections
+
+def select_best_detection(detections):
+    """Select only the best single detection"""
+    if not detections:
+        return []
+    
+    # Sort by confidence and return only the best one
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    return [detections[0]]  # Return only the best detection
 
 def prune_detection_cache():
     """Prune detection cache to prevent memory buildup"""
@@ -155,8 +436,8 @@ ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
 
 def load_yolo_model():
     """Load YOLOv8n model - lightweight approach for Pi 3A 32-bit"""
-    model_path = "yolov8n.pt"
-    onnx_path = "yolov8n.onnx"
+    model_path = "yolov8s.pt"
+    onnx_path = "yolov8s.onnx"
     
     # First, try to load pre-converted ONNX model
     if os.path.exists(onnx_path):
@@ -213,7 +494,7 @@ def detect_objects_onnx(frame, net):
     height, width = frame.shape[:2]
     
     # Use smaller input size for Pi 3A performance
-    input_size = 416  # Smaller than standard 640 for better performance
+    input_size = 640  # Smaller than standard 640 for better performance
     blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_size, input_size), swapRB=True, crop=False)
     net.setInput(blob)
     
@@ -395,7 +676,7 @@ def detect_objects_simple(frame):
         # Use background subtraction for better person detection
         if not hasattr(detect_objects_simple, 'bg_subtractor'):
             detect_objects_simple.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                detectShadows=True, varThreshold=50, history=500
+                detectShadows=True, varThreshold=20, history=150  # Even more sensitive
             )
         
         fg_mask = detect_objects_simple.bg_subtractor.apply(blurred)
@@ -405,34 +686,57 @@ def detect_objects_simple(frame):
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
         
+        # Additional dilation to connect nearby regions and reduce flickering
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # Even larger kernel
+        fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=3)  # More iterations
+        
         # Find contours in the foreground mask
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Filter contours for person-like objects
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 1200:  # Slightly reduced threshold for better detection
+            if area > 600:  # Even lower threshold for maximum sensitivity
                 x, y, w, h = cv2.boundingRect(contour)
                 
                 # Filter by aspect ratio to detect person-like objects
                 aspect_ratio = h / w if w > 0 else 0
                 
-                # Person-like aspect ratio (taller than wide)
-                if 1.5 < aspect_ratio < 4.0:
+                # Person-like aspect ratio (taller than wide) - very wide range
+                if 1.1 < aspect_ratio < 6.0:
                     # Additional check: ensure reasonable size
-                    if w > 25 and h > 40:  # Slightly reduced minimum size
-                        # Draw bounding box
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    if w > 12 and h > 25:  # Even lower minimum size
+                        # Additional validation: check if contour is reasonably solid
+                        hull = cv2.convexHull(contour)
+                        hull_area = cv2.contourArea(hull)
+                        solidity = area / hull_area if hull_area > 0 else 0
                         
-                        detections.append({
-                            'class': 'person',
-                            'confidence': 0.8,
-                            'bbox': [x, y, x + w, y + h]
-                        })
-                        
-                        if PERFORMANCE_MONITORING:
-                            print(f"[DEBUG] Person detected: area={area:.0f}, aspect={aspect_ratio:.2f}, size={w}x{h}")
+                        # Person-like objects should have reasonable solidity (very low threshold)
+                        if solidity > 0.2:
+                            # Calculate confidence based on multiple factors
+                            confidence = calculate_detection_confidence(area, aspect_ratio, solidity, w, h)
+                            
+                            # Draw bounding box
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                            
+                            detections.append({
+                                'class': 'person',
+                                'confidence': confidence,
+                                'bbox': [x, y, x + w, y + h]
+                            })
+                            
+                            if PERFORMANCE_MONITORING:
+                                print(f"[DEBUG] Person detected: area={area:.0f}, aspect={aspect_ratio:.2f}, size={w}x{h}, solidity={solidity:.2f}, conf={confidence:.2f}")
+        
+        # Apply temporal smoothing to reduce flickering
+        detections = smooth_detections(detections)
+        
+        # Merge overlapping detections to ensure single detection
+        detections = merge_overlapping_detections(detections)
+        
+        # Select only the best single detection
+        detections = select_best_detection(detections)
         
         # Cache the detection result
         cache_detection(detections)
@@ -452,7 +756,7 @@ def detect_objects_simple(frame):
                     aspect_ratio = h / w if w > 0 else 0
                     if 1.2 < aspect_ratio < 3.0:
                         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
                         
                         detections.append({
                             'class': 'person',
@@ -463,6 +767,34 @@ def detect_objects_simple(frame):
             print(f"[WARN] Fallback detection also failed: {e2}")
     
     return detections, frame
+
+def calculate_detection_confidence(area, aspect_ratio, solidity, width, height):
+    """Calculate confidence score based on multiple factors - ultra-permissive for maximum detection"""
+    confidence = 0.7  # Even higher base confidence
+    
+    # Area factor (prefer medium-sized objects)
+    if 600 <= area <= 8000:  # Even wider range
+        confidence += 0.3
+    elif 400 <= area < 600 or 8000 < area <= 15000:
+        confidence += 0.2
+    
+    # Aspect ratio factor (prefer person-like ratios)
+    if 1.2 <= aspect_ratio <= 4.0:  # Very wide range
+        confidence += 0.3
+    elif 1.1 <= aspect_ratio < 1.2 or 4.0 < aspect_ratio <= 5.0:
+        confidence += 0.2
+    
+    # Solidity factor (prefer solid objects)
+    if solidity > 0.4:  # Lowered threshold
+        confidence += 0.2
+    elif solidity > 0.25:
+        confidence += 0.15
+    
+    # Size factor (prefer reasonable person sizes)
+    if 15 <= width <= 150 and 25 <= height <= 300:  # Very wide range
+        confidence += 0.2
+    
+    return min(0.99, confidence)  # Cap at 99%
 
 def initialize_camera():
     """Initialize camera"""
@@ -558,8 +890,8 @@ def detection_worker():
                         # Use heuristic gender classification (PyTorch not available on Pi 3A)
                         gender = classify_gender(annotated, [x1, y1, x2-x1, y2-y1])
                         # annotate on frame and the detection record
-                        cv2.putText(annotated, gender, (x1, y2 + 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                        cv2.putText(annotated, gender, (x1, y2 + 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
                         det['gender'] = gender
                         
                         # Announce person detection
@@ -576,28 +908,28 @@ def detection_worker():
                 last_time = current_time
             
             cv2.putText(annotated, f'FPS: {fps}', (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(annotated, f'Objects: {len(detections)}', (10, 70), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(annotated, f'Time: {datetime.now().strftime("%H:%M:%S")}', (10, 110), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv2.putText(annotated, f'Objects: {len(detections)}', (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv2.putText(annotated, f'Time: {datetime.now().strftime("%H:%M:%S")}', (10, 90), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
             # Debug info
             if len(detections) == 0:
-                cv2.putText(annotated, 'No objects detected', (10, 150), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(annotated, 'Move around to be detected', (10, 180), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(annotated, 'No objects detected', (10, 120), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                cv2.putText(annotated, 'Move around to be detected', (10, 140), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
             else:
-                cv2.putText(annotated, f'Detected: {[d["class"] for d in detections]}', (10, 150), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(annotated, f'Detected: {[d["class"] for d in detections]}', (10, 120), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
             # Performance info
             if PERFORMANCE_MONITORING:
-                cv2.putText(annotated, f'Processed: {performance_stats["frames_processed"]}', (10, 210), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                cv2.putText(annotated, f'Skipped: {performance_stats["frames_skipped"]}', (10, 240), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                cv2.putText(annotated, f'Processed: {performance_stats["frames_processed"]}', (10, 160), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                cv2.putText(annotated, f'Skipped: {performance_stats["frames_skipped"]}', (10, 180), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
             
             # Store latest frame and detections
             latest_frame = annotated
