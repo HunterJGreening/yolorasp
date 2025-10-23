@@ -16,6 +16,7 @@ import warnings
 import webbrowser
 import subprocess
 import os
+import torch
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -24,11 +25,17 @@ app = Flask(__name__)
 
 # Configuration
 CAMERA_INDEX = 0
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-TARGET_FPS = 10  # Lower FPS for Pi
+
+# Override some config per requested snippet
+FRAME_WIDTH = 320
+FRAME_HEIGHT = 240
+TARGET_FPS = 5  # Lower FPS for Pi / snippet value
 PI_IP = "0.0.0.0"
 PI_PORT = 5000
+
+# New detection thresholds
+CONFIDENCE_THRESHOLD = 0.5
+NMS_THRESHOLD = 0.4
 
 # Global variables
 camera = None
@@ -39,18 +46,20 @@ fps = 0
 last_time = time.time()
 detection_running = False
 
-# COCO class names - focusing on people detection
+# COCO class names - use the requested list (keeps earlier entries removed/normalized)
 CLASSES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
-    'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
-    'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa",
+    "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"
 ]
 
 # Person detection only - class ID 0 is 'person' in COCO
@@ -61,21 +70,128 @@ VOICE_ENABLED = True
 last_announcement_time = {}
 ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
 
+# ===============================
+# LOAD MODELS (YOLOv3-tiny + gender .pt)
+# ===============================
+
 def load_yolo_model():
-    """Load YOLO model using OpenCV DNN"""
-    print("Loading YOLO model...")
-    
+    """Load YOLOv3-tiny via OpenCV DNN if available"""
+    cfg = "yolov3-tiny.cfg"
+    weights = "yolov3-tiny.weights"
     try:
-        # Try to load YOLOv8 ONNX model
-        net = cv2.dnn.readNet("yolov8n.onnx")
-        print("YOLOv8 ONNX model loaded successfully!")
+        print("Loading YOLOv3-tiny model...")
+        net = cv2.dnn.readNetFromDarknet(cfg, weights)
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        print("✅ YOLOv3-tiny model loaded successfully!")
         return net
-    except:
-        print("YOLOv8 model not found. Using simple detection...")
+    except Exception as e:
+        print(f"[WARN] YOLOv3-tiny not loaded ({e}). Falling back to simple detection.")
         return None
+
+def load_gender_model():
+    """Load gender classification PyTorch model if available"""
+    path = "gender_model.pt"
+    try:
+        print("Loading gender classification model...")
+        model = torch.load(path, map_location=torch.device("cpu"))
+        model.eval()
+        print("✅ Gender model loaded successfully!")
+        return model
+    except Exception as e:
+        print(f"[WARN] Gender model not loaded ({e}). Gender classification disabled.")
+        return None
+
+# load models at startup (will be used in detection worker)
+yolo_net = load_yolo_model()
+gender_model = load_gender_model()
+
+# ===============================
+# OBJECT DETECTION (YOLOv3-tiny)
+# ===============================
+def detect_objects_opencv(frame, net):
+    """Detect objects using YOLOv3-tiny (OpenCV DNN). Returns detections and annotated frame."""
+    if net is None:
+        # fallback to simple contours-based detector
+        return detect_objects_simple(frame)
+
+    height, width = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+    net.setInput(blob)
+    layer_names = net.getLayerNames()
+    try:
+        output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
+    except:
+        # older OpenCV might return as list of lists
+        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+    layer_outputs = net.forward(output_layers)
+
+    boxes, confidences, class_ids = [], [], []
+
+    for output in layer_outputs:
+        for detection in output:
+            scores = detection[5:]
+            if len(scores) == 0:
+                continue
+            class_id = int(np.argmax(scores))
+            confidence = float(scores[class_id])
+            if confidence > CONFIDENCE_THRESHOLD:
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                boxes.append([x, y, w, h])
+                confidences.append(confidence)
+                class_ids.append(class_id)
+
+    indices = []
+    if len(boxes) > 0:
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+
+    detections = []
+
+    if len(indices) > 0:
+        for i in np.array(indices).flatten():
+            x, y, w, h = boxes[i]
+            class_id = class_ids[i]
+            confidence = confidences[i]
+            label = f"{CLASSES[class_id] if class_id < len(CLASSES) else class_id}: {confidence:.2f}"
+            color = (0, 255, 0)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            detections.append({
+                "class": CLASSES[class_id] if class_id < len(CLASSES) else str(class_id),
+                "confidence": round(confidence, 2),
+                "bbox": [max(0, x), max(0, y), min(width, x + w), min(height, y + h)]
+            })
+
+    return detections, frame
+
+# ===============================
+# GENDER CLASSIFICATION (PyTorch)
+# ===============================
+def predict_gender(face_crop):
+    """Predict gender using loaded PyTorch model (if available)."""
+    if gender_model is None:
+        return "Unknown"
+    try:
+        face = cv2.resize(face_crop, (64, 64))
+        face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        face = torch.tensor(face.transpose(2, 0, 1), dtype=torch.float32).unsqueeze(0) / 255.0
+        with torch.no_grad():
+            output = gender_model(face)
+            pred = torch.argmax(output, dim=1).item()
+        return "Male" if pred == 1 else "Female"
+    except Exception as e:
+        # if prediction fails, return Unknown
+        return "Unknown"
 
 def classify_gender(frame, bbox):
     """Simple gender classification based on clothing colors and patterns"""
+    # Keep original heuristic as fallback if PyTorch model not available
     x, y, w, h = bbox
     
     # Extract person region
@@ -84,22 +200,24 @@ def classify_gender(frame, bbox):
     if person_region.size == 0:
         return "Unknown"
     
-    # Convert to HSV for better color analysis
-    hsv = cv2.cvtColor(person_region, cv2.COLOR_BGR2HSV)
+    # If PyTorch model present, try that first (using bounding box crop)
+    if gender_model is not None:
+        try:
+            g = predict_gender(person_region)
+            if g != "Unknown":
+                return g
+        except:
+            pass
     
-    # Analyze colors in the upper body region (top 40% of bounding box)
+    # Fallback heuristic:
+    hsv = cv2.cvtColor(person_region, cv2.COLOR_BGR2HSV)
     upper_region = person_region[:int(h*0.4), :]
     if upper_region.size > 0:
-        # Calculate average color
         avg_color = np.mean(upper_region, axis=(0, 1))
-        
-        # Simple heuristic: darker colors might indicate male clothing
-        # This is a very basic approach - in reality you'd need ML models
         brightness = np.mean(avg_color)
-        
-        if brightness < 100:  # Darker colors
+        if brightness < 100:
             return "Male"
-        elif brightness > 150:  # Lighter colors
+        elif brightness > 150:
             return "Female"
         else:
             return "Unknown"
@@ -146,76 +264,6 @@ def announce_person(gender, bbox):
     except Exception as e:
         print(f"⚠️ Voice announcement failed: {e}")
 
-def detect_objects_opencv(frame, net):
-    """Detect objects using OpenCV DNN"""
-    if net is None:
-        return [], frame
-    
-    height, width = frame.shape[:2]
-    
-    # Create blob from frame
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
-    net.setInput(blob)
-    
-    # Get detections
-    outputs = net.forward()
-    
-    detections = []
-    boxes = []
-    confidences = []
-    class_ids = []
-    
-    for output in outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
-            
-            # Only detect people (class_id = 0)
-            if confidence > 0.5 and class_id == PERSON_CLASS_ID:
-                center_x = int(detection[0] * width)
-                center_y = int(detection[1] * height)
-                w = int(detection[2] * width)
-                h = int(detection[3] * height)
-                
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
-                
-                boxes.append([x, y, w, h])
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
-    
-    # Apply non-maximum suppression
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-    
-    if len(indices) > 0:
-        for i in indices.flatten():
-            x, y, w, h = boxes[i]
-            confidence = confidences[i]
-            class_id = class_ids[i]
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
-            # Classify gender
-            gender = classify_gender(frame, [x, y, w, h])
-            
-            # Announce person detection
-            announce_person(gender, [x, y, w, h])
-            
-            # Draw label with gender
-            label = f"{CLASSES[class_id]} ({gender}): {confidence:.2f}"
-            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            detections.append({
-                'class': CLASSES[class_id],
-                'gender': gender,
-                'confidence': round(confidence, 2),
-                'bbox': [x, y, x + w, y + h]
-            })
-    
-    return detections, frame
-
 def detect_objects_simple(frame):
     """Simple object detection using OpenCV (no YOLO model needed)"""
     detections = []
@@ -258,20 +306,23 @@ def initialize_camera():
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     camera.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    try:
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except:
+        pass
     
     print("[OK] Camera initialized")
     return True
 
 def detection_worker():
     """Background thread for continuous detection"""
-    global latest_frame, latest_detections, frame_count, fps, last_time, detection_running
+    global latest_frame, latest_detections, frame_count, fps, last_time, detection_running, yolo_net
     
     print("Starting detection worker...")
     detection_running = True
     
-    # Load model
-    net = load_yolo_model()
+    # Use already-loaded yolo_net (loaded at module import)
+    net = yolo_net
     
     frame_delay = 1.0 / TARGET_FPS
     
@@ -291,10 +342,25 @@ def detection_worker():
         
         # Run detection
         try:
-            if net is not None:
-                detections, annotated = detect_objects_opencv(frame.copy(), net)
-            else:
-                detections, annotated = detect_objects_simple(frame.copy())
+            detections, annotated = detect_objects_opencv(frame.copy(), net)
+            
+            # Run gender detection for people if possible
+            for det in detections:
+                if det.get("class") == "person":
+                    x1, y1, x2, y2 = det.get("bbox", [0,0,0,0])
+                    # ensure ints and bounds
+                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                    x1 = max(0, x1); y1 = max(0, y1)
+                    x2 = min(annotated.shape[1]-1, x2); y2 = min(annotated.shape[0]-1, y2)
+                    if x2 > x1 and y2 > y1:
+                        crop = annotated[y1:y2, x1:x2]
+                        gender = classify_gender(crop, [0, 0, x2-x1, y2-y1])
+                        # annotate on frame and the detection record
+                        cv2.putText(annotated, gender, (x1, y2 + 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                        det['gender'] = gender
+                    else:
+                        det['gender'] = "Unknown"
             
             # Add FPS counter and stats
             frame_count += 1
