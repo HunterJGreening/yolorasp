@@ -33,9 +33,27 @@ TARGET_FPS = 3  # Reduced FPS for Pi 3A stability
 PI_IP = "0.0.0.0"
 PI_PORT = 5000
 
+# Performance optimization settings
+FRAME_SKIP_COUNT = 2  # Process every 3rd frame for better performance
+DETECTION_CACHE_SIZE = 5  # Cache last N detections
+MEMORY_CLEANUP_INTERVAL = 100  # Cleanup every N frames
+PERFORMANCE_MONITORING = True  # Enable performance stats
+
 # Detection thresholds optimized for Pi 3A
 CONFIDENCE_THRESHOLD = 0.6  # Higher threshold to reduce false positives
 NMS_THRESHOLD = 0.4
+
+# Performance optimization variables
+detection_cache = []
+frame_skip_counter = 0
+memory_cleanup_counter = 0
+performance_stats = {
+    'frames_processed': 0,
+    'frames_skipped': 0,
+    'detections_found': 0,
+    'avg_processing_time': 0.0,
+    'memory_usage': 0
+}
 
 # Global variables
 camera = None
@@ -45,6 +63,67 @@ frame_count = 0
 fps = 0
 last_time = time.time()
 detection_running = False
+
+def prune_detection_cache():
+    """Prune detection cache to prevent memory buildup"""
+    global detection_cache
+    if len(detection_cache) > DETECTION_CACHE_SIZE:
+        # Keep only the most recent detections
+        detection_cache = detection_cache[-DETECTION_CACHE_SIZE:]
+
+def cleanup_memory():
+    """Cleanup memory and optimize performance"""
+    global memory_cleanup_counter, performance_stats
+    
+    memory_cleanup_counter += 1
+    if memory_cleanup_counter >= MEMORY_CLEANUP_INTERVAL:
+        memory_cleanup_counter = 0
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Prune detection cache
+        prune_detection_cache()
+        
+        # Update performance stats
+        if PERFORMANCE_MONITORING:
+            try:
+                import psutil
+                performance_stats['memory_usage'] = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+            except ImportError:
+                pass
+        
+        print(f"[PERF] Memory cleanup completed. Cache size: {len(detection_cache)}")
+
+def should_process_frame():
+    """Determine if current frame should be processed (frame skipping)"""
+    global frame_skip_counter
+    frame_skip_counter += 1
+    
+    # Process every FRAME_SKIP_COUNT + 1 frames
+    if frame_skip_counter > FRAME_SKIP_COUNT:
+        frame_skip_counter = 0
+        return True
+    return False
+
+def get_cached_detection():
+    """Get cached detection if available"""
+    global detection_cache
+    if len(detection_cache) > 0:
+        # Return the most recent detection
+        return detection_cache[-1]
+    return None
+
+def cache_detection(detections):
+    """Cache detection results for reuse"""
+    global detection_cache
+    if detections:
+        detection_cache.append({
+            'detections': detections,
+            'timestamp': time.time()
+        })
+        prune_detection_cache()
 
 # COCO class names - use the requested list (keeps earlier entries removed/normalized)
 CLASSES = [
@@ -298,41 +377,90 @@ def announce_person(gender, bbox):
         print(f"⚠️ Voice announcement failed: {e}")
 
 def detect_objects_simple(frame):
-    """Simple object detection using OpenCV (optimized for Pi 3A)"""
+    """Improved simple object detection using OpenCV (optimized for Pi 3A)"""
     detections = []
     
     try:
+        # Check if we can reuse cached detection
+        cached = get_cached_detection()
+        if cached and (time.time() - cached['timestamp']) < 0.5:  # Use cache for 500ms
+            return cached['detections'], frame
+        
         # Convert to grayscale for better performance
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Apply Gaussian blur to reduce noise (smaller kernel for performance)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)  # Reduced from (5,5)
         
-        # Adaptive threshold for better edge detection
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        # Use background subtraction for better person detection
+        if not hasattr(detect_objects_simple, 'bg_subtractor'):
+            detect_objects_simple.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                detectShadows=True, varThreshold=50, history=500
+            )
         
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        fg_mask = detect_objects_simple.bg_subtractor.apply(blurred)
         
-        # Filter and draw rectangles around detected objects
+        # Clean up the mask (smaller kernel for performance)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))  # Reduced from (3,3)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Find contours in the foreground mask
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours for person-like objects
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 2000:  # Higher threshold for Pi 3A to reduce false positives
+            if area > 1200:  # Slightly reduced threshold for better detection
                 x, y, w, h = cv2.boundingRect(contour)
                 
                 # Filter by aspect ratio to detect person-like objects
                 aspect_ratio = h / w if w > 0 else 0
-                if 1.2 < aspect_ratio < 3.0:  # Person-like aspect ratio
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    
-                    detections.append({
-                        'class': 'person',
-                        'confidence': 0.7,
-                        'bbox': [x, y, x + w, y + h]
-                    })
+                
+                # Person-like aspect ratio (taller than wide)
+                if 1.5 < aspect_ratio < 4.0:
+                    # Additional check: ensure reasonable size
+                    if w > 25 and h > 40:  # Slightly reduced minimum size
+                        # Draw bounding box
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+                        detections.append({
+                            'class': 'person',
+                            'confidence': 0.8,
+                            'bbox': [x, y, x + w, y + h]
+                        })
+                        
+                        if PERFORMANCE_MONITORING:
+                            print(f"[DEBUG] Person detected: area={area:.0f}, aspect={aspect_ratio:.2f}, size={w}x{h}")
+        
+        # Cache the detection result
+        cache_detection(detections)
+    
     except Exception as e:
         print(f"[WARN] Simple detection failed: {e}")
+        # Fallback to basic edge detection
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 2000:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    aspect_ratio = h / w if w > 0 else 0
+                    if 1.2 < aspect_ratio < 3.0:
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+                        detections.append({
+                            'class': 'person',
+                            'confidence': 0.7,
+                            'bbox': [x, y, x + w, y + h]
+                        })
+        except Exception as e2:
+            print(f"[WARN] Fallback detection also failed: {e2}")
     
     return detections, frame
 
@@ -367,16 +495,18 @@ def initialize_camera():
     return True
 
 def detection_worker():
-    """Background thread for continuous detection"""
+    """Background thread for continuous detection (optimized for Pi 3A)"""
     global latest_frame, latest_detections, frame_count, fps, last_time, detection_running, yolo_net
+    global performance_stats
     
-    print("Starting detection worker...")
+    print("Starting optimized detection worker...")
     detection_running = True
     
     # Use already-loaded yolo_net (loaded at module import)
     net = yolo_net
     
     frame_delay = 1.0 / TARGET_FPS
+    processing_times = []
     
     while detection_running:
         loop_start = time.time()
@@ -392,9 +522,29 @@ def detection_worker():
             time.sleep(0.1)
             continue
         
+        # Frame skipping for better performance
+        if not should_process_frame():
+            performance_stats['frames_skipped'] += 1
+            # Still update the frame for streaming, but skip detection
+            latest_frame = frame
+            time.sleep(frame_delay)
+            continue
+        
         # Run detection
         try:
+            detection_start = time.time()
             detections, annotated = detect_objects_opencv(frame.copy(), net)
+            detection_time = time.time() - detection_start
+            
+            # Update performance stats
+            performance_stats['frames_processed'] += 1
+            performance_stats['detections_found'] += len(detections)
+            processing_times.append(detection_time)
+            
+            # Keep only last 10 processing times for average
+            if len(processing_times) > 10:
+                processing_times = processing_times[-10:]
+            performance_stats['avg_processing_time'] = sum(processing_times) / len(processing_times)
             
             # Run gender detection for people (heuristic method only)
             for det in detections:
@@ -432,9 +582,29 @@ def detection_worker():
             cv2.putText(annotated, f'Time: {datetime.now().strftime("%H:%M:%S")}', (10, 110), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
+            # Debug info
+            if len(detections) == 0:
+                cv2.putText(annotated, 'No objects detected', (10, 150), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(annotated, 'Move around to be detected', (10, 180), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            else:
+                cv2.putText(annotated, f'Detected: {[d["class"] for d in detections]}', (10, 150), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Performance info
+            if PERFORMANCE_MONITORING:
+                cv2.putText(annotated, f'Processed: {performance_stats["frames_processed"]}', (10, 210), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                cv2.putText(annotated, f'Skipped: {performance_stats["frames_skipped"]}', (10, 240), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
             # Store latest frame and detections
             latest_frame = annotated
             latest_detections = detections
+            
+            # Periodic memory cleanup
+            cleanup_memory()
             
         except Exception as e:
             print(f"[ERROR] Detection failed: {e}")
@@ -536,6 +706,7 @@ def dashboard():
                 <a href="/stream" class="button">📺 View Live Stream</a>
                 <a href="/api/detections" class="button">🔍 API Endpoint</a>
                 <a href="/health" class="button">❤️ Health Check</a>
+                <a href="/performance" class="button">📊 Performance</a>
                 <button onclick="toggleVoice()" class="button" id="voiceButton">🔊 Voice: ON</button>
             </div>
             
@@ -707,6 +878,23 @@ def health():
         'camera': camera_status,
         'fps': fps,
         'voice_enabled': VOICE_ENABLED,
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/performance', methods=['GET'])
+def get_performance():
+    """Performance monitoring endpoint"""
+    global performance_stats
+    
+    return jsonify({
+        'success': True,
+        'performance': performance_stats,
+        'optimization_settings': {
+            'frame_skip_count': FRAME_SKIP_COUNT,
+            'detection_cache_size': DETECTION_CACHE_SIZE,
+            'memory_cleanup_interval': MEMORY_CLEANUP_INTERVAL,
+            'target_fps': TARGET_FPS
+        },
         'timestamp': datetime.now().isoformat()
     })
 
