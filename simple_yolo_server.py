@@ -295,7 +295,13 @@ def initialize_camera():
     """Initialize camera"""
     global camera
     print("Initializing camera...")
-    camera = cv2.VideoCapture(CAMERA_INDEX)
+    # Try V4L2 backend first (better for Pi cameras)
+    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    
+    # If V4L2 fails, try default backend
+    if not camera.isOpened():
+        print("[INFO] V4L2 backend failed, trying default backend...")
+        camera = cv2.VideoCapture(CAMERA_INDEX)
     
     if not camera.isOpened():
         print("[ERROR] Cannot open camera")
@@ -304,10 +310,13 @@ def initialize_camera():
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     camera.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    
+    # Additional settings for Pi camera stability
     try:
         camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
     except:
-        pass
+        pass  # Some properties might not be supported
     
     print("[OK] Camera initialized")
     return True
