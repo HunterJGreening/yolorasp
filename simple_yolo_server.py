@@ -1,0 +1,1287 @@
+#!/usr/bin/env python3
+"""
+Simple YOLO Server for Raspberry Pi using OpenCV DNN
+- No ultralytics dependency required
+- Uses OpenCV's built-in DNN module
+- Works with basic packages only
+"""
+import cv2
+import numpy as np
+import base64
+import time
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify, Response, render_template_string
+import warnings
+import webbrowser
+import subprocess
+import os
+# import torch  # Removed for Pi 3A 32-bit compatibility
+
+# Suppress deprecation warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+
+app = Flask(__name__)
+
+# Configuration optimized for Pi 3A 32-bit
+CAMERA_INDEX = 0
+
+# Optimized settings for Pi 3A performance
+FRAME_WIDTH = 320
+FRAME_HEIGHT = 320
+TARGET_FPS = 4  # Reduced FPS for Pi 3A stability
+PI_IP = "0.0.0.0"
+PI_PORT = 5000
+
+# Performance optimization settings
+FRAME_SKIP_COUNT = 0  # Process every 3rd frame for better performance
+DETECTION_CACHE_SIZE = 5  # Cache last N detections
+MEMORY_CLEANUP_INTERVAL = 50  # Cleanup every N frames
+PERFORMANCE_MONITORING = False  # Enable performance stats
+
+# Detection thresholds optimized for Pi 3A
+CONFIDENCE_THRESHOLD = 0.3 # Higher threshold to reduce false positives
+NMS_THRESHOLD = 0.45
+
+# Performance optimization variables
+detection_cache = []
+frame_skip_counter = 0
+memory_cleanup_counter = 0
+performance_stats = {
+    'frames_processed': 0,
+    'frames_skipped': 0,
+    'detections_found': 0,
+    'avg_processing_time': 0.0,
+    'memory_usage': 0
+}
+
+# Tracking stability variables
+tracking_history = []
+stable_detection_threshold = 1  # Even more permissive - accept single frame detections
+last_stable_detection = None
+confidence_smoothing = []
+detection_persistence_frames = 8  # Keep detection alive for 8 frames even if lost
+last_detection_time = 0
+
+# Anti-flickering variables
+bbox_history = []  # Store bounding box history for smoothing
+max_bbox_history = 2  # Keep last 5 bounding boxes
+position_smoothing_factor = 0.5  # How much to smooth position changes
+
+# Global variables
+camera = None
+latest_frame = None
+latest_detections = []
+frame_count = 0
+fps = 0
+last_time = time.time()
+detection_running = False
+
+def smooth_detections(current_detections):
+    """Apply temporal smoothing to reduce flickering - ultra-permissive for maximum tracking"""
+    global tracking_history, last_stable_detection, last_detection_time
+    
+    current_time = time.time()
+    
+    if not current_detections:
+        # No current detections, but keep last stable detection alive longer
+        if last_stable_detection and (current_time - last_stable_detection['timestamp']) < 1.5:  # Extended to 1.5 seconds
+            # Return last stable detection if it's recent
+            return [last_stable_detection['detection']]
+        
+        # Decay tracking history very slowly
+        tracking_history = tracking_history[-6:] if len(tracking_history) > 6 else []
+        return []
+    
+    # Add current detections to history
+    tracking_history.append({
+        'detections': current_detections,
+        'timestamp': current_time
+    })
+    
+    # Keep only recent history (last 5 frames for better smoothing)
+    tracking_history = tracking_history[-5:]
+    
+    # Find stable detections across multiple frames
+    stable_detections = []
+    
+    for detection in current_detections:
+        if detection.get('class') == 'person':
+            x1, y1, x2, y2 = detection['bbox']
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            
+            # Count how many recent frames have similar detections
+            similar_count = 0
+            for hist_frame in tracking_history[-3:]:  # Check last 3 frames
+                for hist_det in hist_frame['detections']:
+                    if hist_det.get('class') == 'person':
+                        hx1, hy1, hx2, hy2 = hist_det['bbox']
+                        h_center_x = (hx1 + hx2) / 2
+                        h_center_y = (hy1 + hy2) / 2
+                        
+                        # Check if centers are close (within 60 pixels)
+                        distance = ((center_x - h_center_x) ** 2 + (center_y - h_center_y) ** 2) ** 0.5
+                        if distance < 60:
+                            similar_count += 1
+                            break
+            
+            # Accept detection if found in at least 1 recent frame
+            if similar_count >= 1:
+                # Apply strong smoothing to bbox
+                smoothed_bbox = smooth_bbox_position(detection['bbox'])
+                
+                # Apply position constraints
+                constrained_bbox = apply_position_constraints(smoothed_bbox)
+                
+                detection['bbox'] = constrained_bbox
+                detection['confidence'] = min(0.001, detection['confidence'] + 0.001)  # Moderate confidence boost
+                
+                # Store as last stable detection
+                last_stable_detection = {
+                    'detection': detection,
+                    'timestamp': current_time
+                }
+                last_detection_time = current_time
+                
+                stable_detections.append(detection)
+    
+    # Merge overlapping detections before returning
+    stable_detections = merge_overlapping_detections(stable_detections)
+    
+    return stable_detections
+
+def smooth_bbox(current_bbox, history):
+    """Smooth bounding box coordinates using historical data - minimal smoothing for responsiveness"""
+    if len(history) < 1:
+        return current_bbox
+    
+    # Get recent similar detections
+    recent_bboxes = []
+    x1, y1, x2, y2 = current_bbox
+    center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+    
+    for hist_frame in history[-2:]:  # Check last 2 frames
+        for hist_det in hist_frame['detections']:
+            if hist_det.get('class') == 'person':
+                hx1, hy1, hx2, hy2 = hist_det['bbox']
+                h_center_x, h_center_y = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+                
+                distance = ((center_x - h_center_x) ** 2 + (center_y - h_center_y) ** 2) ** 0.5
+                if distance < 60:  # Reduced tolerance for better stability
+                    recent_bboxes.append([hx1, hy1, hx2, hy2])
+    
+    if len(recent_bboxes) > 0:
+        # Calculate average bbox
+        avg_bbox = [
+            sum(bbox[0] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[1] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[2] for bbox in recent_bboxes) / len(recent_bboxes),
+            sum(bbox[3] for bbox in recent_bboxes) / len(recent_bboxes)
+        ]
+        
+        # Stronger blending (70% current, 30% average) for better stability
+        smoothed = [
+            int(0.7 * current_bbox[i] + 0.3 * avg_bbox[i]) for i in range(4)
+        ]
+        return smoothed
+    
+    return current_bbox
+
+def smooth_bbox_position(current_bbox):
+    """Apply strong smoothing to bounding box position to eliminate flickering"""
+    global bbox_history
+    
+    # Add current bbox to history
+    bbox_history.append(current_bbox.copy())
+    
+    # Keep only recent history
+    if len(bbox_history) > max_bbox_history:
+        bbox_history = bbox_history[-max_bbox_history:]
+    
+    # If we don't have enough history, return current bbox
+    if len(bbox_history) < 2:
+        return current_bbox
+    
+    # Calculate smoothed bbox using exponential moving average
+    smoothed_bbox = current_bbox.copy()
+    
+    for i in range(4):  # x1, y1, x2, y2
+        # Calculate weighted average with more weight on recent values
+        weights = [0.1, 0.2, 0.3, 0.4, 0.5]  # Increasing weights for more recent values
+        weighted_sum = 0
+        total_weight = 0
+        
+        for j, bbox in enumerate(bbox_history[-5:]):  # Use last 5 bboxes
+            if j < len(weights):
+                weighted_sum += bbox[i] * weights[j]
+                total_weight += weights[j]
+        
+        if total_weight > 0:
+            smoothed_bbox[i] = int(weighted_sum / total_weight)
+    
+    return smoothed_bbox
+
+def apply_position_constraints(bbox):
+    """Apply constraints to prevent extreme position changes"""
+    global bbox_history
+    
+    if len(bbox_history) < 2:
+        return bbox
+    
+    # Get previous bbox
+    prev_bbox = bbox_history[-1]
+    
+    # Calculate maximum allowed change per frame
+    max_change = 20  # pixels per frame
+    
+    constrained_bbox = []
+    for i in range(4):
+        current_val = bbox[i]
+        prev_val = prev_bbox[i]
+        diff = current_val - prev_val
+        
+        # Limit the change
+        if abs(diff) > max_change:
+            if diff > 0:
+                constrained_val = prev_val + max_change
+            else:
+                constrained_val = prev_val - max_change
+        else:
+            constrained_val = current_val
+        
+        constrained_bbox.append(int(constrained_val))
+    
+    return constrained_bbox
+    """Merge overlapping detections to ensure only one detection per person"""
+    if len(detections) <= 1:
+        return detections
+    
+    # Sort detections by confidence (highest first)
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    merged_detections = []
+    used_indices = set()
+    
+    for i, detection in enumerate(detections):
+        if i in used_indices:
+            continue
+            
+        x1, y1, x2, y2 = detection['bbox']
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        # Find overlapping detections
+        overlapping_indices = [i]
+        for j, other_detection in enumerate(detections):
+            if j <= i or j in used_indices:
+                continue
+                
+            ox1, oy1, ox2, oy2 = other_detection['bbox']
+            other_center_x = (ox1 + ox2) / 2
+            other_center_y = (oy1 + oy2) / 2
+            
+            # Check if centers are close (within 100 pixels)
+            distance = ((center_x - other_center_x) ** 2 + (center_y - other_center_y) ** 2) ** 0.5
+            if distance < 100:
+                overlapping_indices.append(j)
+        
+        # Merge overlapping detections
+        if len(overlapping_indices) > 1:
+            # Calculate weighted average bbox based on confidence
+            total_weight = 0
+            weighted_x1 = 0
+            weighted_y1 = 0
+            weighted_x2 = 0
+            weighted_y2 = 0
+            max_confidence = 0
+            
+            for idx in overlapping_indices:
+                det = detections[idx]
+                weight = det['confidence']
+                total_weight += weight
+                
+                dx1, dy1, dx2, dy2 = det['bbox']
+                weighted_x1 += dx1 * weight
+                weighted_y1 += dy1 * weight
+                weighted_x2 += dx2 * weight
+                weighted_y2 += dy2 * weight
+                
+                if det['confidence'] > max_confidence:
+                    max_confidence = det['confidence']
+            
+            # Create merged detection
+            merged_bbox = [
+                int(weighted_x1 / total_weight),
+                int(weighted_y1 / total_weight),
+                int(weighted_x2 / total_weight),
+                int(weighted_y2 / total_weight)
+            ]
+            
+            merged_detection = {
+                'class': 'person',
+                'confidence': min(0.99, max_confidence + 0.1),  # Boost confidence for merged detection
+                'bbox': merged_bbox
+            }
+            
+            merged_detections.append(merged_detection)
+            
+            # Mark all overlapping detections as used
+            for idx in overlapping_indices:
+                used_indices.add(idx)
+        else:
+            # No overlapping detections, keep as is
+            merged_detections.append(detection)
+            used_indices.add(i)
+    
+    return merged_detections
+
+def select_best_detection(detections):
+    """Select only the best single detection"""
+    if not detections:
+        return []
+    
+    # Sort by confidence and return only the best one
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    return [detections[0]]  # Return only the best detection
+
+def prune_detection_cache():
+    """Prune detection cache to prevent memory buildup"""
+    global detection_cache
+    if len(detection_cache) > DETECTION_CACHE_SIZE:
+        # Keep only the most recent detections
+        detection_cache = detection_cache[-DETECTION_CACHE_SIZE:]
+
+def cleanup_memory():
+    """Cleanup memory and optimize performance"""
+    global memory_cleanup_counter, performance_stats
+    
+    memory_cleanup_counter += 1
+    if memory_cleanup_counter >= MEMORY_CLEANUP_INTERVAL:
+        memory_cleanup_counter = 0
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Prune detection cache
+        prune_detection_cache()
+        
+        # Update performance stats
+        if PERFORMANCE_MONITORING:
+            try:
+                import psutil
+                performance_stats['memory_usage'] = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+            except ImportError:
+                pass
+        
+        print(f"[PERF] Memory cleanup completed. Cache size: {len(detection_cache)}")
+
+def should_process_frame():
+    """Determine if current frame should be processed (frame skipping)"""
+    global frame_skip_counter
+    frame_skip_counter += 1
+    
+    # Process every FRAME_SKIP_COUNT + 1 frames
+    if frame_skip_counter > FRAME_SKIP_COUNT:
+        frame_skip_counter = 0
+        return True
+    return False
+
+def get_cached_detection():
+    """Get cached detection if available"""
+    global detection_cache
+    if len(detection_cache) > 0:
+        # Return the most recent detection
+        return detection_cache[-1]
+    return None
+
+def cache_detection(detections):
+    """Cache detection results for reuse"""
+    global detection_cache
+    if detections:
+        detection_cache.append({
+            'detections': detections,
+            'timestamp': time.time()
+        })
+        prune_detection_cache()
+
+# COCO class names - use the requested list (keeps earlier entries removed/normalized)
+CLASSES = [
+    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa",
+    "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"
+]
+
+# Person detection only - class ID 0 is 'person' in COCO
+PERSON_CLASS_ID = 0
+
+# Voice announcement settings
+VOICE_ENABLED = True
+last_announcement_time = {}
+ANNOUNCEMENT_COOLDOWN = 5  # seconds between announcements for same person
+
+# ===============================
+# LOAD MODELS (YOLOv3-tiny + gender .pt)
+# ===============================
+
+def load_yolo_model():
+    """Load YOLOv8n model - lightweight approach for Pi 3A 32-bit"""
+    model_path = "yolov8s.pt"
+    onnx_path = "yolov8s.onnx"
+    
+    # First, try to load pre-converted ONNX model
+    if os.path.exists(onnx_path):
+        try:
+            print("Loading YOLOv8n ONNX model for Pi 3A...")
+            net = cv2.dnn.readNetFromONNX(onnx_path)
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            print("✅ YOLOv8n ONNX model loaded successfully!")
+            return net
+        except Exception as e:
+            print(f"[WARN] Failed to load ONNX model: {e}")
+    
+    # Check if .pt file exists but no ONNX
+    if os.path.exists(model_path):
+        print(f"[INFO] Found {model_path} but no ONNX version.")
+        print("[INFO] To use YOLOv8n, convert the model to ONNX format:")
+        print("[INFO] 1. On a more powerful machine with ultralytics installed:")
+        print("[INFO] 2. Run: from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx')")
+        print("[INFO] 3. Copy the generated yolov8n.onnx to your Pi")
+        print("[INFO] 4. Or use simple detection mode (no conversion needed)")
+    
+    print("[INFO] Using simple detection mode (no YOLOv8n)")
+    return None
+
+def load_gender_model():
+    """Gender classification disabled for Pi 3A 32-bit compatibility"""
+    print("[INFO] Gender classification using heuristic method only (PyTorch not available on Pi 3A 32-bit)")
+    return None
+
+# load models at startup (will be used in detection worker)
+yolo_net = load_yolo_model()
+gender_model = load_gender_model()
+
+# ===============================
+# OBJECT DETECTION (YOLOv3-tiny)
+# ===============================
+def detect_objects_opencv(frame, net):
+    """Detect objects using YOLOv8n ONNX (OpenCV DNN) or fallback to simple detection."""
+    if net is None:
+        # fallback to simple contours-based detector
+        return detect_objects_simple(frame)
+
+    # Check if it's an OpenCV DNN model (ONNX)
+    if hasattr(net, 'setInput'):
+        return detect_objects_onnx(frame, net)
+    else:
+        # Unknown model type, fallback to simple detection
+        print("[WARN] Unknown model type, falling back to simple detection")
+        return detect_objects_simple(frame)
+
+def detect_objects_onnx(frame, net):
+    """Detect objects using YOLOv8n ONNX model via OpenCV DNN (optimized for Pi 3A)"""
+    height, width = frame.shape[:2]
+    
+    # Use smaller input size for Pi 3A performance
+    input_size = 640  # Smaller than standard 640 for better performance
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_size, input_size), swapRB=True, crop=False)
+    net.setInput(blob)
+    
+    try:
+        outputs = net.forward()
+    except Exception as e:
+        print(f"[WARN] ONNX inference failed: {e}")
+        return detect_objects_simple(frame)
+    
+    boxes, confidences, class_ids = [], [], []
+    
+    # YOLOv8n ONNX output format: [1, 84, 8400] where 84 = 4 (bbox) + 80 (classes)
+    if len(outputs) > 0:
+        output = outputs[0]
+        if len(output.shape) == 3:
+            output = output[0]  # Remove batch dimension
+        
+        # Process detections
+        for detection in output.T:
+            scores = detection[4:]
+            class_id = int(np.argmax(scores))
+            confidence = float(scores[class_id])
+            
+            if confidence > CONFIDENCE_THRESHOLD:
+                # Extract bounding box (normalized coordinates)
+                x_center, y_center, w, h = detection[:4]
+                
+                # Convert to pixel coordinates
+                x = int((x_center - w/2) * width)
+                y = int((y_center - h/2) * height)
+                w = int(w * width)
+                h = int(h * height)
+                
+                # Ensure coordinates are within frame bounds
+                x = max(0, min(x, width))
+                y = max(0, min(y, height))
+                w = min(w, width - x)
+                h = min(h, height - y)
+                
+                if w > 0 and h > 0:  # Valid bounding box
+                    boxes.append([x, y, w, h])
+                    confidences.append(confidence)
+                    class_ids.append(class_id)
+    
+    # Apply NMS
+    indices = []
+    if len(boxes) > 0:
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+    
+    detections = []
+    if len(indices) > 0:
+        for i in np.array(indices).flatten():
+            x, y, w, h = boxes[i]
+            class_id = class_ids[i]
+            confidence = confidences[i]
+            
+            # Only detect people for gender classification
+            if class_id == PERSON_CLASS_ID:
+                label = f"{CLASSES[class_id]}: {confidence:.2f}"
+                color = (0, 255, 0)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                detections.append({
+                    "class": CLASSES[class_id],
+                    "confidence": round(confidence, 2),
+                    "bbox": [x, y, x + w, y + h]
+                })
+    
+    return detections, frame
+
+# Remove the PyTorch detection function since we're not using PyTorch
+
+# ===============================
+# GENDER CLASSIFICATION (PyTorch)
+# ===============================
+def predict_gender(face_crop):
+    """Predict gender using heuristic method only (PyTorch not available on Pi 3A 32-bit)."""
+    # Always return Unknown since PyTorch model is not available
+    return "Unknown"
+
+def classify_gender(frame, bbox):
+    """Gender classification using heuristic method (optimized for Pi 3A)"""
+    x, y, w, h = bbox
+    
+    # Extract person region
+    person_region = frame[y:y+h, x:x+w]
+    
+    if person_region.size == 0:
+        return "Unknown"
+    
+    # Improved heuristic method for Pi 3A
+    try:
+        # Focus on upper body region for clothing analysis
+        upper_region = person_region[:int(h*0.4), :]
+        if upper_region.size > 0:
+            # Convert to HSV for better color analysis
+            hsv = cv2.cvtColor(upper_region, cv2.COLOR_BGR2HSV)
+            
+            # Analyze color characteristics
+            avg_color = np.mean(upper_region, axis=(0, 1))
+            brightness = np.mean(avg_color)
+            
+            # Analyze hue distribution
+            hue_values = hsv[:, :, 0].flatten()
+            hue_mean = np.mean(hue_values)
+            hue_std = np.std(hue_values)
+            
+            # Simple classification based on brightness and color patterns
+            if brightness < 80:
+                return "Male"  # Darker clothing
+            elif brightness > 180:
+                return "Female"  # Brighter clothing
+            elif hue_std > 30:  # More varied colors
+                return "Female"
+            else:
+                return "Male"
+    except Exception as e:
+        print(f"[WARN] Gender classification failed: {e}")
+    
+    return "Unknown"
+
+def announce_person(gender, bbox):
+    """Announce when a person is detected"""
+    global last_announcement_time, ANNOUNCEMENT_COOLDOWN
+    
+    if not VOICE_ENABLED:
+        return
+    
+    # Create a unique ID for this person based on position
+    x, y, w, h = bbox
+    person_id = f"{x//50}_{y//50}"  # Grid-based ID to avoid duplicate announcements
+    
+    current_time = time.time()
+    
+    # Check if we've announced this person recently
+    if person_id in last_announcement_time:
+        if current_time - last_announcement_time[person_id] < ANNOUNCEMENT_COOLDOWN:
+            return
+    
+    # Update last announcement time
+    last_announcement_time[person_id] = current_time
+    
+    # Create announcement text
+    if gender == "Male":
+        message = "Male person detected"
+    elif gender == "Female":
+        message = "Female person detected"
+    else:
+        message = "Person detected"
+    
+    print(f"🔊 ANNOUNCING: {message}")
+    
+    # Use espeak for text-to-speech (install with: sudo apt install espeak)
+    try:
+        subprocess.Popen(['espeak', '-s', '150', '-v', 'en', message], 
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("⚠️ espeak not installed. Install with: sudo apt install espeak")
+    except Exception as e:
+        print(f"⚠️ Voice announcement failed: {e}")
+
+def detect_objects_simple(frame):
+    """Improved simple object detection using OpenCV (optimized for Pi 3A)"""
+    detections = []
+    
+    try:
+        # Check if we can reuse cached detection
+        cached = get_cached_detection()
+        if cached and (time.time() - cached['timestamp']) < 0.5:  # Use cache for 500ms
+            return cached['detections'], frame
+        
+        # Convert to grayscale for better performance
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise (smaller kernel for performance)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)  # Reduced from (5,5)
+        
+        # Use background subtraction for better person detection
+        if not hasattr(detect_objects_simple, 'bg_subtractor'):
+            detect_objects_simple.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                detectShadows=True, varThreshold=20, history=150  # Even more sensitive
+            )
+        
+        fg_mask = detect_objects_simple.bg_subtractor.apply(blurred)
+        
+        # Clean up the mask (smaller kernel for performance)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))  # Reduced from (3,3)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Additional dilation to connect nearby regions and reduce flickering
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # Even larger kernel
+        fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=3)  # More iterations
+        
+        # Find contours in the foreground mask
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours for person-like objects
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 600:  # Even lower threshold for maximum sensitivity
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Filter by aspect ratio to detect person-like objects
+                aspect_ratio = h / w if w > 0 else 0
+                
+                # Person-like aspect ratio (taller than wide) - very wide range
+                if 1.1 < aspect_ratio < 6.0:
+                    # Additional check: ensure reasonable size
+                    if w > 12 and h > 25:  # Even lower minimum size
+                        # Additional validation: check if contour is reasonably solid
+                        hull = cv2.convexHull(contour)
+                        hull_area = cv2.contourArea(hull)
+                        solidity = area / hull_area if hull_area > 0 else 0
+                        
+                        # Person-like objects should have reasonable solidity (very low threshold)
+                        if solidity > 0.2:
+                            # Calculate confidence based on multiple factors
+                            confidence = calculate_detection_confidence(area, aspect_ratio, solidity, w, h)
+                            
+                            # Draw bounding box
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                            
+                            detections.append({
+                                'class': 'person',
+                                'confidence': confidence,
+                                'bbox': [x, y, x + w, y + h]
+                            })
+                            
+                            if PERFORMANCE_MONITORING:
+                                print(f"[DEBUG] Person detected: area={area:.0f}, aspect={aspect_ratio:.2f}, size={w}x{h}, solidity={solidity:.2f}, conf={confidence:.2f}")
+        
+        # Apply temporal smoothing to reduce flickering
+        detections = smooth_detections(detections)
+        
+        # Merge overlapping detections to ensure single detection
+        detections = merge_overlapping_detections(detections)
+        
+        # Select only the best single detection
+        detections = select_best_detection(detections)
+        
+        # Cache the detection result
+        cache_detection(detections)
+    
+    except Exception as e:
+        print(f"[WARN] Simple detection failed: {e}")
+        # Fallback to basic edge detection
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 2000:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    aspect_ratio = h / w if w > 0 else 0
+                    if 1.2 < aspect_ratio < 3.0:
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                        
+                        detections.append({
+                            'class': 'person',
+                            'confidence': 0.7,
+                            'bbox': [x, y, x + w, y + h]
+                        })
+        except Exception as e2:
+            print(f"[WARN] Fallback detection also failed: {e2}")
+    
+    return detections, frame
+
+def calculate_detection_confidence(area, aspect_ratio, solidity, width, height):
+    """Calculate confidence score based on multiple factors - ultra-permissive for maximum detection"""
+    confidence = 0.7  # Even higher base confidence
+    
+    # Area factor (prefer medium-sized objects)
+    if 600 <= area <= 8000:  # Even wider range
+        confidence += 0.3
+    elif 400 <= area < 600 or 8000 < area <= 15000:
+        confidence += 0.2
+    
+    # Aspect ratio factor (prefer person-like ratios)
+    if 1.2 <= aspect_ratio <= 4.0:  # Very wide range
+        confidence += 0.3
+    elif 1.1 <= aspect_ratio < 1.2 or 4.0 < aspect_ratio <= 5.0:
+        confidence += 0.2
+    
+    # Solidity factor (prefer solid objects)
+    if solidity > 0.4:  # Lowered threshold
+        confidence += 0.2
+    elif solidity > 0.25:
+        confidence += 0.15
+    
+    # Size factor (prefer reasonable person sizes)
+    if 15 <= width <= 150 and 25 <= height <= 300:  # Very wide range
+        confidence += 0.2
+    
+    return min(0.99, confidence)  # Cap at 99%
+
+def initialize_camera():
+    """Initialize camera"""
+    global camera
+    print("Initializing camera...")
+    # Try V4L2 backend first (better for Pi cameras)
+    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    
+    # If V4L2 fails, try default backend
+    if not camera.isOpened():
+        print("[INFO] V4L2 backend failed, trying default backend...")
+        camera = cv2.VideoCapture(CAMERA_INDEX)
+    
+    if not camera.isOpened():
+        print("[ERROR] Cannot open camera")
+        return False
+    
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    camera.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    
+    # Additional settings for Pi camera stability
+    try:
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    except:
+        pass  # Some properties might not be supported
+    
+    print("[OK] Camera initialized")
+    return True
+
+def detection_worker():
+    """Background thread for continuous detection (optimized for Pi 3A)"""
+    global latest_frame, latest_detections, frame_count, fps, last_time, detection_running, yolo_net
+    global performance_stats
+    
+    print("Starting optimized detection worker...")
+    detection_running = True
+    
+    # Use already-loaded yolo_net (loaded at module import)
+    net = yolo_net
+    
+    frame_delay = 1.0 / TARGET_FPS
+    processing_times = []
+    
+    while detection_running:
+        loop_start = time.time()
+        
+        if camera is None or not camera.isOpened():
+            time.sleep(0.1)
+            continue
+        
+        # Capture frame
+        ret, frame = camera.read()
+        if not ret:
+            print("[WARNING] Failed to capture frame")
+            time.sleep(0.1)
+            continue
+        
+        # Frame skipping for better performance
+        if not should_process_frame():
+            performance_stats['frames_skipped'] += 1
+            # Still update the frame for streaming, but skip detection
+            latest_frame = frame
+            time.sleep(frame_delay)
+            continue
+        
+        # Run detection
+        try:
+            detection_start = time.time()
+            detections, annotated = detect_objects_opencv(frame.copy(), net)
+            detection_time = time.time() - detection_start
+            
+            # Update performance stats
+            performance_stats['frames_processed'] += 1
+            performance_stats['detections_found'] += len(detections)
+            processing_times.append(detection_time)
+            
+            # Keep only last 10 processing times for average
+            if len(processing_times) > 10:
+                processing_times = processing_times[-10:]
+            performance_stats['avg_processing_time'] = sum(processing_times) / len(processing_times)
+            
+            # Run gender detection for people (heuristic method only)
+            for det in detections:
+                if det.get("class") == "person":
+                    x1, y1, x2, y2 = det.get("bbox", [0,0,0,0])
+                    # ensure ints and bounds
+                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                    x1 = max(0, x1); y1 = max(0, y1)
+                    x2 = min(annotated.shape[1]-1, x2); y2 = min(annotated.shape[0]-1, y2)
+                    if x2 > x1 and y2 > y1:
+                        # Use heuristic gender classification (PyTorch not available on Pi 3A)
+                        gender = classify_gender(annotated, [x1, y1, x2-x1, y2-y1])
+                        # annotate on frame and the detection record
+                        cv2.putText(annotated, gender, (x1, y2 + 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
+                        det['gender'] = gender
+                        
+                        # Announce person detection
+                        announce_person(gender, [x1, y1, x2-x1, y2-y1])
+                    else:
+                        det['gender'] = "Unknown"
+            
+            # Add FPS counter and stats
+            frame_count += 1
+            current_time = time.time()
+            if current_time - last_time >= 1.0:
+                fps = frame_count
+                frame_count = 0
+                last_time = current_time
+            
+            cv2.putText(annotated, f'FPS: {fps}', (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv2.putText(annotated, f'Objects: {len(detections)}', (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv2.putText(annotated, f'Time: {datetime.now().strftime("%H:%M:%S")}', (10, 90), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Debug info
+            if len(detections) == 0:
+                cv2.putText(annotated, 'No objects detected', (10, 120), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                cv2.putText(annotated, 'Move around to be detected', (10, 140), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            else:
+                cv2.putText(annotated, f'Detected: {[d["class"] for d in detections]}', (10, 120), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Performance info
+            if PERFORMANCE_MONITORING:
+                cv2.putText(annotated, f'Processed: {performance_stats["frames_processed"]}', (10, 160), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                cv2.putText(annotated, f'Skipped: {performance_stats["frames_skipped"]}', (10, 180), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+            # Store latest frame and detections
+            latest_frame = annotated
+            latest_detections = detections
+            
+            # Periodic memory cleanup
+            cleanup_memory()
+            
+        except Exception as e:
+            print(f"[ERROR] Detection failed: {e}")
+        
+        # Maintain target FPS
+        elapsed = time.time() - loop_start
+        sleep_time = max(0, frame_delay - elapsed)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+@app.route('/')
+def dashboard():
+    """Main dashboard page"""
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Simple Pi YOLO Server</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                min-height: 100vh;
+            }
+            .container {
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 30px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            }
+            h1 {
+                text-align: center;
+                color: #fff;
+                text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+                margin-bottom: 30px;
+            }
+            .status {
+                background: rgba(0, 255, 0, 0.2);
+                border: 2px solid #00ff00;
+                border-radius: 10px;
+                padding: 15px;
+                text-align: center;
+                margin: 20px 0;
+                font-weight: bold;
+                font-size: 18px;
+            }
+            .button {
+                display: inline-block;
+                padding: 12px 24px;
+                background: linear-gradient(45deg, #4CAF50, #45a049);
+                color: white;
+                text-decoration: none;
+                border-radius: 25px;
+                margin: 10px 5px;
+                transition: all 0.3s ease;
+                font-weight: bold;
+                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            }
+            .button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+            }
+            .actions {
+                text-align: center;
+                margin: 30px 0;
+            }
+            .info-card {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 15px;
+                padding: 20px;
+                margin: 15px 0;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>👥 People Detection Server</h1>
+            
+            <div class="status">
+                ✓ Server Running - People Detection Active
+            </div>
+            
+            <div class="info-card">
+                <h3>📊 Server Information</h3>
+                <p><strong>Detection:</strong> YOLOv8n (ONNX) or Simple Detection</p>
+                <p><strong>Gender Classification:</strong> Heuristic Color Analysis (Pi 3A Optimized)</p>
+                <p><strong>Camera:</strong> Built-in Webcam</p>
+                <p><strong>Resolution:</strong> 320x240</p>
+                <p><strong>Target FPS:</strong> 3</p>
+            </div>
+            
+            <div class="actions">
+                <a href="/stream" class="button">📺 View Live Stream</a>
+                <a href="/api/detections" class="button">🔍 API Endpoint</a>
+                <a href="/health" class="button">❤️ Health Check</a>
+                <a href="/performance" class="button">📊 Performance</a>
+                <button onclick="toggleVoice()" class="button" id="voiceButton">🔊 Voice: ON</button>
+            </div>
+            
+            <script>
+            function toggleVoice() {
+                fetch('/toggle_voice', {method: 'POST'})
+                .then(response => response.json())
+                .then(data => {
+                    const button = document.getElementById('voiceButton');
+                    button.textContent = data.voice_enabled ? '🔊 Voice: ON' : '🔇 Voice: OFF';
+                    alert(data.message);
+                });
+            }
+            </script>
+            
+            <div class="info-card">
+                <h3>📖 How to Use</h3>
+                <ol>
+                    <li><strong>Live Stream:</strong> Click "View Live Stream" to see detection</li>
+                    <li><strong>API Access:</strong> Use /api/detections for programmatic access</li>
+                    <li><strong>Health Check:</strong> Monitor server status with /health</li>
+                    <li><strong>PC Access:</strong> Access from PC using Pi's IP address on port 5000</li>
+                </ol>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+@app.route('/stream')
+def stream_viewer():
+    """Live stream viewer page"""
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Live Detection Stream</title>
+        <style>
+            body {
+                margin: 0;
+                padding: 20px;
+                background: #1a1a1a;
+                font-family: Arial, sans-serif;
+                color: white;
+            }
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+            h1 {
+                text-align: center;
+                color: #00ff00;
+                text-shadow: 0 0 15px #00ff00;
+                margin-bottom: 30px;
+            }
+            .stream-container {
+                background: #2a2a2a;
+                padding: 20px;
+                border-radius: 15px;
+                box-shadow: 0 0 30px rgba(0,255,0,0.4);
+                margin: 20px 0;
+                text-align: center;
+            }
+            #stream {
+                width: 100%;
+                max-width: 800px;
+                height: auto;
+                border-radius: 10px;
+                border: 2px solid #00ff00;
+            }
+            .controls {
+                background: #333;
+                padding: 20px;
+                border-radius: 10px;
+                margin: 20px 0;
+                text-align: center;
+            }
+            .status-indicator {
+                display: inline-block;
+                width: 12px;
+                height: 12px;
+                background: #00ff00;
+                border-radius: 50%;
+                animation: pulse 2s infinite;
+                margin-right: 10px;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            .back-button {
+                display: inline-block;
+                padding: 10px 20px;
+                background: #4CAF50;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+                margin: 10px;
+                transition: background 0.3s;
+            }
+            .back-button:hover {
+                background: #45a049;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎥 Live Detection Stream</h1>
+            
+            <div class="stream-container">
+                <img id="stream" src="/video_feed" />
+            </div>
+            
+            <div class="controls">
+                <p><span class="status-indicator"></span>LIVE - Streaming from Raspberry Pi Camera</p>
+                <p>YOLOv8n object detection optimized for Pi 3A 32-bit</p>
+                <a href="/" class="back-button">← Back to Dashboard</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+def generate_stream():
+    """Generate MJPEG stream from latest frames"""
+    global latest_frame
+    
+    while True:
+        if latest_frame is not None:
+            ret, buffer = cv2.imencode('.jpg', latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            frame_bytes = buffer.tobytes()
+            
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        else:
+            time.sleep(0.1)
+
+@app.route('/video_feed')
+def video_feed():
+    """MJPEG stream endpoint"""
+    return Response(generate_stream(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/detections', methods=['GET'])
+def get_detections():
+    """API endpoint to get current detections"""
+    global latest_detections, fps
+    
+    return jsonify({
+        'success': True,
+        'detections': latest_detections,
+        'count': len(latest_detections),
+        'fps': fps,
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    global camera, fps, VOICE_ENABLED
+    
+    camera_status = "connected" if camera and camera.isOpened() else "disconnected"
+    
+    return jsonify({
+        'status': 'ok',
+        'model': 'opencv_dnn',
+        'mode': 'live_detection',
+        'camera': camera_status,
+        'fps': fps,
+        'voice_enabled': VOICE_ENABLED,
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/performance', methods=['GET'])
+def get_performance():
+    """Performance monitoring endpoint"""
+    global performance_stats
+    
+    return jsonify({
+        'success': True,
+        'performance': performance_stats,
+        'optimization_settings': {
+            'frame_skip_count': FRAME_SKIP_COUNT,
+            'detection_cache_size': DETECTION_CACHE_SIZE,
+            'memory_cleanup_interval': MEMORY_CLEANUP_INTERVAL,
+            'target_fps': TARGET_FPS
+        },
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/toggle_voice', methods=['POST'])
+def toggle_voice():
+    """Toggle voice announcements on/off"""
+    global VOICE_ENABLED
+    
+    VOICE_ENABLED = not VOICE_ENABLED
+    status = "enabled" if VOICE_ENABLED else "disabled"
+    
+    return jsonify({
+        'success': True,
+        'voice_enabled': VOICE_ENABLED,
+        'message': f"Voice announcements {status}"
+    })
+
+def cleanup():
+    """Cleanup function"""
+    global camera, detection_running
+    
+    print("\nShutting down...")
+    detection_running = False
+    
+    if camera:
+        camera.release()
+    
+    print("Cleanup complete.")
+
+if __name__ == '__main__':
+    print("\n" + "="*60)
+    print("🍓 Simple Pi Detection Server")
+    print("="*60)
+    
+    # Initialize camera
+    if not initialize_camera():
+        print("[ERROR] Failed to initialize camera")
+        exit(1)
+    
+    # Start detection thread
+    detection_thread = threading.Thread(target=detection_worker, daemon=True)
+    detection_thread.start()
+    
+    print(f"Server starting on {PI_IP}:{PI_PORT}")
+    print(f"Web interface: http://[PI_IP]:{PI_PORT}")
+    print(f"Live stream: http://[PI_IP]:{PI_PORT}/stream")
+    print(f"API endpoint: http://[PI_IP]:{PI_PORT}/api/detections")
+    print("="*60 + "\n")
+    
+    # Auto-open browser after 1.5 seconds
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PI_PORT}/stream")).start()
+    
+    try:
+        app.run(host=PI_IP, port=PI_PORT, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        cleanup()
+    finally:
+        cleanup()
